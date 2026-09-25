@@ -77,8 +77,18 @@ type OnboardingActionEvent = {
 
 type EnterpriseSignInUiState = 'options' | 'instance' | 'progress';
 
-assertDefined(product.defaultChatAgent, 'Onboarding requires a default chat agent product configuration.');
-const defaultChat = product.defaultChatAgent;
+const defaultChat = product.defaultChatAgent ?? {
+	extensionId: '',
+	chatExtensionId: '',
+	provider: {
+		default: { id: 'codex-cn', name: 'Codex CN' },
+		enterprise: { id: 'codex-cn-enterprise', name: 'Codex CN' },
+	},
+	providerUriSetting: '',
+	termsStatementUrl: '',
+	privacyStatementUrl: '',
+	publicCodeMatchesUrl: '',
+} as NonNullable<typeof product.defaultChatAgent>;
 
 /**
  * Variation A — Classic Wizard Modal
