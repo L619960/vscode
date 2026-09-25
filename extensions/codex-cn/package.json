@@ -10,7 +10,7 @@
   },
   "main": "./out/extension",
   "extensionKind": ["ui"],
-  "activationEvents": [],
+  "activationEvents": ["onStartupFinished"],
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
@@ -19,7 +19,7 @@
   },
   "contributes": {
     "viewsContainers": {
-      "activitybar": [
+      "secondarySidebar": [
         {
           "id": "codex-cn",
           "title": "Codex CN",

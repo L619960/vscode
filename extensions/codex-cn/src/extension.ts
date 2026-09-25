@@ -27,6 +27,12 @@ const diffProvider = new DiffContentProvider()
 function activate(context: vscode.ExtensionContext): void {
   session = new Session(context.globalState)
 
+  // 首次启动自动在右侧辅助栏打开 Agent 面板（Cursor 式默认布局），仅一次
+  if (!context.globalState.get('codex-cn.autofocused')) {
+    void context.globalState.update('codex-cn.autofocused', true)
+    void vscode.commands.executeCommand('codex-cn.chat.focus')
+  }
+
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider('codexcn-diff', diffProvider)
   )
