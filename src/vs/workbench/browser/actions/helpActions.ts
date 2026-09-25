@@ -6,17 +6,15 @@
 import { localize, localize2 } from '../../../nls.js';
 import product from '../../../platform/product/common/product.js';
 import { isMacintosh, isLinux, language, isWeb } from '../../../base/common/platform.js';
-import { ITelemetryService } from '../../../platform/telemetry/common/telemetry.js';
 import { IOpenerService } from '../../../platform/opener/common/opener.js';
 import { URI } from '../../../base/common/uri.js';
-import { MenuId, Action2, registerAction2, MenuRegistry } from '../../../platform/actions/common/actions.js';
+import { MenuId, Action2, registerAction2 } from '../../../platform/actions/common/actions.js';
 import { KeyChord, KeyMod, KeyCode } from '../../../base/common/keyCodes.js';
 import { IProductService } from '../../../platform/product/common/productService.js';
 import { ServicesAccessor } from '../../../platform/instantiation/common/instantiation.js';
 import { KeybindingWeight } from '../../../platform/keybinding/common/keybindingsRegistry.js';
 import { Categories } from '../../../platform/action/common/actionCommonCategories.js';
 import { ICommandService } from '../../../platform/commands/common/commands.js';
-import { ContextKeyExpr } from '../../../platform/contextkey/common/contextkey.js';
 import { IsSessionsWindowContext } from '../../common/contextkeys.js';
 
 class KeybindingsReferenceAction extends Action2 {
@@ -151,28 +149,6 @@ class OpenDocumentationUrlAction extends Action2 {
 		if (url) {
 			openerService.open(URI.parse(url));
 		}
-	}
-}
-
-class OpenNewsletterSignupUrlAction extends Action2 {
-
-	static readonly ID = 'workbench.action.openNewsletterSignupUrl';
-	static readonly AVAILABLE = !!product.newsletterSignupUrl;
-
-	constructor() {
-		super({
-			id: OpenNewsletterSignupUrlAction.ID,
-			title: localize2('newsletterSignup', 'Signup for the VS Code Newsletter'),
-			category: Categories.Help,
-			f1: true
-		});
-	}
-
-	run(accessor: ServicesAccessor) {
-		const productService = accessor.get(IProductService);
-		const openerService = accessor.get(IOpenerService);
-		const telemetryService = accessor.get(ITelemetryService);
-		openerService.open(URI.parse(`${productService.newsletterSignupUrl}?machineId=${encodeURIComponent(telemetryService.machineId)}`));
 	}
 }
 
@@ -335,36 +311,6 @@ class GetStartedWithAccessibilityFeatures extends Action2 {
 	}
 }
 
-class AskVSCodeCopilot extends Action2 {
-	static readonly ID = 'workbench.action.askVScode';
-
-	constructor() {
-		super({
-			id: AskVSCodeCopilot.ID,
-			title: localize2('askVScode', 'Ask @vscode'),
-			category: Categories.Help,
-			f1: true,
-			precondition: ContextKeyExpr.and(ContextKeyExpr.equals('chatSetupHidden', false), ContextKeyExpr.equals('chatSetupDisabledInWorkspace', false), IsSessionsWindowContext.negate())
-		});
-	}
-
-	async run(accessor: ServicesAccessor): Promise<void> {
-		const commandService = accessor.get(ICommandService);
-		commandService.executeCommand('workbench.action.chat.open', { mode: 'agent', query: '@vscode ', isPartialQuery: true });
-
-	}
-}
-
-MenuRegistry.appendMenuItem(MenuId.MenubarHelpMenu, {
-	command: {
-		id: AskVSCodeCopilot.ID,
-		title: localize2('askVScode', 'Ask @vscode'),
-	},
-	order: 7,
-	group: '1_welcome',
-	when: ContextKeyExpr.and(ContextKeyExpr.equals('chatSetupHidden', false), ContextKeyExpr.equals('chatSetupDisabledInWorkspace', false), IsSessionsWindowContext.negate())
-});
-
 // --- Actions Registration
 
 if (KeybindingsReferenceAction.AVAILABLE) {
@@ -381,10 +327,6 @@ if (OpenTipsAndTricksUrlAction.AVAILABLE) {
 
 if (OpenDocumentationUrlAction.AVAILABLE) {
 	registerAction2(OpenDocumentationUrlAction);
-}
-
-if (OpenNewsletterSignupUrlAction.AVAILABLE) {
-	registerAction2(OpenNewsletterSignupUrlAction);
 }
 
 if (OpenYouTubeUrlAction.AVAILABLE) {
@@ -404,5 +346,3 @@ if (OpenPrivacyStatementUrlAction.AVAILABLE) {
 }
 
 registerAction2(GetStartedWithAccessibilityFeatures);
-
-registerAction2(AskVSCodeCopilot);

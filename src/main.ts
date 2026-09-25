@@ -146,7 +146,7 @@ let nlsConfigurationPromise: Promise<INLSConfiguration> | undefined = undefined;
 // No matter the OS, if the array is empty, default back to 'en'.
 // Note: this forces Chromium's locale init and costs ~90ms; deferring it past `app.ready` only relocates that cost.
 perf.mark('code/willGetPreferredSystemLanguages');
-const osLocale = processZhLocale((app.getPreferredSystemLanguages()?.[0] ?? 'en').toLowerCase());
+const osLocale = processZhLocale((app.getPreferredSystemLanguages()?.[0] ?? 'zh-cn').toLowerCase());
 perf.mark('code/didGetPreferredSystemLanguages');
 const userLocale = getUserDefinedLocale(argvConfig);
 if (userLocale) {
@@ -169,7 +169,7 @@ if (userLocale) {
 // In that case, use `en` as the Electron locale.
 
 if (process.platform === 'win32' || process.platform === 'linux') {
-	const electronLocale = (!userLocale || userLocale === 'qps-ploc') ? 'en' : userLocale;
+	const electronLocale = (!userLocale || userLocale === 'qps-ploc') ? 'zh-cn' : userLocale;
 	app.commandLine.appendSwitch('lang', electronLocale);
 }
 
@@ -563,7 +563,7 @@ function configureCrashReporter(): void {
 
 	// Start crash reporter for all processes
 	const productName = (product.crashReporter ? product.crashReporter.productName : undefined) || product.nameShort;
-	const companyName = (product.crashReporter ? product.crashReporter.companyName : undefined) || 'Microsoft';
+	const companyName = (product.crashReporter ? product.crashReporter.companyName : undefined) || 'Codex CN';
 	const uploadToServer = Boolean(!process.env['VSCODE_DEV'] && submitURL && !crashReporterDirectory);
 	crashReporter.start({
 		companyName,
@@ -727,13 +727,13 @@ async function resolveNlsConfiguration(): Promise<INLSConfiguration> {
 		let userLocale = app.getLocale();
 		if (!userLocale) {
 			return {
-				userLocale: 'en',
+				userLocale: 'zh-cn',
 				osLocale,
 				resolvedLanguage: 'en',
 				defaultMessagesFile: path.join(import.meta.dirname, 'nls.messages.json'),
 
 				// NLS: below 2 are a relic from old times only used by vscode-nls and deprecated
-				locale: 'en',
+				locale: 'zh-cn',
 				availableLanguages: {}
 			};
 		}
