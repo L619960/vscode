@@ -140,6 +140,24 @@ const electronAssetResolver = electronFeed
 	}
 	: undefined;
 
+// Fork builds without access to the internal Azure feed use a local, offline
+// asset resolver: prebuilt Electron archives are placed in
+// `.build/electron-assets/<artifactFileName>` (e.g.
+// `electron-v43.7.3-win32-x64.zip` and `SHASUMS256.txt`), avoiding slow or
+// blocked downloads from GitHub during packaging.
+const localElectronAssetsDir = path.join(root, '.build', 'electron-assets');
+const localElectronAssetResolver = electronFeed
+	? undefined
+	: async ({ fileName }: { url: string; fileName: string }): Promise<Response> => {
+		const filePath = path.join(localElectronAssetsDir, path.basename(fileName));
+		if (!fs.existsSync(filePath)) {
+			return new Response(null, { status: 404, statusText: `Missing local electron asset: ${fileName}` });
+		}
+		const size = (await fs.promises.stat(filePath)).size;
+		const body = Readable.toWeb(fs.createReadStream(filePath)) as ReadableStream<Uint8Array>;
+		return new Response(body, { status: 200, headers: { 'Content-Length': String(size) } });
+	};
+
 export const config = {
 	version: electronVersion,
 	productAppName: product.nameLong,
@@ -239,7 +257,7 @@ export const config = {
 	linuxExecutableName: product.applicationName,
 	winIcon: 'resources/win32/code.ico',
 	token: process.env['GITHUB_TOKEN'],
-	repo: electronAssetResolver,
+	repo: electronAssetResolver ?? localElectronAssetResolver,
 	validateChecksum: true,
 	checksumFile: path.join(root, 'build', 'checksums', 'electron.txt'),
 	createVersionedResources: useVersionedUpdate,
