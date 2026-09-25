@@ -75,6 +75,11 @@
           "enum": ["auto", "yes", "no"],
           "enumDescriptions": ["自动检测（400 自动降级）", "强制启用工具调用", "关闭（纯对话）"],
           "description": "工具调用支持"
+        },
+        "codex-cn.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "自动审批：AI 写文件/编辑/运行命令不再询问（请谨慎开启）"
         }
       }
     }

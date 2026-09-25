@@ -39,7 +39,9 @@ export async function chatCompletion(opts: {
 }): Promise<ChatResult> {
   const { messages, tools, config, signal, onToken, onDegraded } = opts
 
-  if (!config.apiKey) {
+  // 本地服务（llama.cpp / Ollama 等）无需 API Key
+  const isLocal = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(config.baseUrl)
+  if (!config.apiKey && !isLocal) {
     return { content: '', toolCalls: [], finishReason: null, degraded: false, error: '未配置 API Key，请先在设置中填写' }
   }
 
@@ -70,7 +72,24 @@ export async function chatCompletion(opts: {
 
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '')
-    return { content: '', toolCalls: [], finishReason: null, degraded: false, error: `API 错误 ${resp.status}: ${errText.slice(0, 300)}` }
+    // llama.cpp 服务端 500 重试一次（本地模型生成长 JSON 时偶发格式错误）
+    if (resp.status === 500 && errText.includes('parse tool call')) {
+      await new Promise(r => setTimeout(r, 800))
+      try {
+        const retryResp = await post(url, config.apiKey, makeBody(withTools), signal)
+        if (retryResp.ok) {
+          resp = retryResp
+        } else {
+          const retryText = await retryResp.text().catch(() => '')
+          return { content: '', toolCalls: [], finishReason: null, degraded: false, error: `API 错误 ${retryResp.status}: ${retryText.slice(0, 300)}` }
+        }
+      } catch (e) {
+        if ((e as Error).name === 'AbortError') return { content: '', toolCalls: [], finishReason: null, degraded: false, aborted: true }
+        return { content: '', toolCalls: [], finishReason: null, degraded: false, error: `网络错误: ${(e as Error).message}` }
+      }
+    } else {
+      return { content: '', toolCalls: [], finishReason: null, degraded: false, error: `API 错误 ${resp.status}: ${errText.slice(0, 300)}` }
+    }
   }
   const degraded = !withTools && !!tools?.length
 

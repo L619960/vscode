@@ -45,9 +45,15 @@ function activate(context: vscode.ExtensionContext): void {
     void vscode.commands.executeCommand('vscode.diff', left, right, `Codex CN: ${req.path || '文件变更'}`)
   }
 
-  // 审批桥：请求推给 webview，等待按钮回调
+  // 审批桥：请求推给 webview，等待按钮回调；开启自动审批或会话免审批时直接放行
+  // 但危险命令（rm/del/shutdown 等）始终询问，防止误操作
   const requestApproval = (req: ApprovalRequest): Promise<ApprovalDecision> => {
-    if (autoApproved.has(req.toolName)) return Promise.resolve({ decision: 'allow' })
+    if (req.danger) {
+      // 危险命令不自动放行，必须人工确认
+    } else {
+      const auto = vscode.workspace.getConfiguration('codex-cn').get<boolean>('autoApprove', false)
+      if (auto || autoApproved.has(req.toolName)) return Promise.resolve({ decision: 'allow' })
+    }
     return new Promise<ApprovalDecision>((resolve) => {
       const id = `apr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
       pending.set(id, resolve)
@@ -86,19 +92,20 @@ function activate(context: vscode.ExtensionContext): void {
       const key = await getApiKey(context.secrets)
       return {
         provider: c.get('provider'), baseUrl: c.get('baseUrl'), model: c.get('model'),
-        supportsTools: c.get('supportsTools'), hasKey: !!key,
+        supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), hasKey: !!key,
         presets: Object.fromEntries(Object.entries(PROVIDER_PRESETS).map(([k, v]) => [k, v.label])),
       }
     },
-    async saveConfig(patch: { provider?: string; baseUrl?: string; model?: string; supportsTools?: string; apiKey?: string }) {
+    async saveConfig(patch: { provider?: string; baseUrl?: string; model?: string; supportsTools?: string; autoApprove?: boolean; apiKey?: string }) {
       if (patch.provider && patch.provider !== getProvider()) {
         await setConfig({ provider: patch.provider })
         await applyProviderPreset(patch.provider)
       }
-      const rest: Partial<{ baseUrl: string; model: string; supportsTools: string }> = {}
+      const rest: Partial<{ baseUrl: string; model: string; supportsTools: string; autoApprove: boolean }> = {}
       if (patch.baseUrl !== undefined) rest.baseUrl = patch.baseUrl
       if (patch.model !== undefined) rest.model = patch.model
       if (patch.supportsTools !== undefined) rest.supportsTools = patch.supportsTools
+      if (patch.autoApprove !== undefined) rest.autoApprove = patch.autoApprove
       if (Object.keys(rest).length) await setConfig(rest)
       if (patch.apiKey) await saveApiKey(context.secrets, patch.apiKey)
     },

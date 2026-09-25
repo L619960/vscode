@@ -42,14 +42,19 @@ export async function applyProviderPreset(provider: string): Promise<void> {
   await c.update('model', preset.model, vscode.ConfigurationTarget.Global)
 }
 
-export function setConfig(patch: Partial<{ provider: string; baseUrl: string; model: string; supportsTools: string }>): Thenable<void> {
+export function setConfig(patch: Partial<{ provider: string; baseUrl: string; model: string; supportsTools: string; autoApprove: boolean }>): Thenable<void> {
   const c = cfg()
-  const targets: Array<[string, string]> = []
-  if (patch.provider !== undefined) targets.push(['provider', patch.provider])
-  if (patch.baseUrl !== undefined) targets.push(['baseUrl', patch.baseUrl])
-  if (patch.model !== undefined) targets.push(['model', patch.model])
-  if (patch.supportsTools !== undefined) targets.push(['supportsTools', patch.supportsTools])
-  return Promise.all(targets.map(([k, v]) => c.update(k, v, vscode.ConfigurationTarget.Global))).then(() => undefined)
+  const strTargets: Array<[string, string]> = []
+  const boolTargets: Array<[string, boolean]> = []
+  if (patch.provider !== undefined) strTargets.push(['provider', patch.provider])
+  if (patch.baseUrl !== undefined) strTargets.push(['baseUrl', patch.baseUrl])
+  if (patch.model !== undefined) strTargets.push(['model', patch.model])
+  if (patch.supportsTools !== undefined) strTargets.push(['supportsTools', patch.supportsTools])
+  if (patch.autoApprove !== undefined) boolTargets.push(['autoApprove', patch.autoApprove])
+  return Promise.all([
+    ...strTargets.map(([k, v]) => c.update(k, v, vscode.ConfigurationTarget.Global)),
+    ...boolTargets.map(([k, v]) => c.update(k, v, vscode.ConfigurationTarget.Global)),
+  ]).then(() => undefined)
 }
 
 /** API Key 存入 SecretStorage（VS Code 加密落盘） */

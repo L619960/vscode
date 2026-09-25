@@ -9,6 +9,7 @@ const provider = ref('doubao')
 const baseUrl = ref('')
 const modelName = ref('')
 const supportsTools = ref('auto')
+const autoApprove = ref(false)
 const apiKey = ref('')
 const hasKey = ref(false)
 const presets = ref<Record<string, string>>({})
@@ -22,6 +23,7 @@ onMounted(() => {
       baseUrl.value = d.baseUrl
       modelName.value = d.model
       supportsTools.value = d.supportsTools
+      autoApprove.value = !!d.autoApprove
       hasKey.value = d.hasKey
       presets.value = d.presets
     } else if (e.data?.type === 'configSaved') {
@@ -39,6 +41,7 @@ function save(): void {
     patch: {
       provider: provider.value, baseUrl: baseUrl.value.trim(),
       model: modelName.value.trim(), supportsTools: supportsTools.value,
+      autoApprove: autoApprove.value,
       ...(apiKey.value.trim() ? { apiKey: apiKey.value.trim() } : {}),
     },
   })
@@ -75,6 +78,13 @@ function save(): void {
         <option value="yes">强制启用</option>
         <option value="no">关闭（纯对话）</option>
       </select>
+    </div>
+    <div class="field">
+      <label class="check-row">
+        <input type="checkbox" v-model="autoApprove" />
+        <span>自动审批（AI 自主执行写文件/命令，不再询问）</span>
+      </label>
+      <span class="hint">开启后 AI 可直接改文件、跑命令，请谨慎使用</span>
     </div>
     <button class="btn primary block" @click="save">{{ saved ? '✓ 已保存' : '保存配置' }}</button>
   </div>

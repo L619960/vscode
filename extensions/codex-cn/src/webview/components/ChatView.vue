@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 对话视图：消息流 + 工具卡片（含审批按钮）+ 输入区
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { vscodeApi } from '../main'
 
 interface ToolRun {
@@ -99,11 +99,18 @@ function decide(a: Approval, decision: string, extra?: { viewDiff?: boolean }): 
 
 const hasDiff = (a: Approval): boolean => a.oldContent !== undefined && a.newContent !== undefined
 const statusText = computed(() => (running.value ? '停止' : '发送'))
+
+// 自动滚动到底部
+const msgListEl = ref<HTMLElement | null>(null)
+watch(messages, async () => {
+  await nextTick()
+  if (msgListEl.value) msgListEl.value.scrollTop = msgListEl.value.scrollHeight
+}, { deep: true, flush: 'post' })
 </script>
 
 <template>
   <div class="chat-view">
-    <div class="msg-list">
+    <div class="msg-list" ref="msgListEl">
       <div v-if="messages.length === 0" class="empty">
         <p>👋 描述你的任务</p>
         <span>AI 会读项目、改文件、跑命令</span>

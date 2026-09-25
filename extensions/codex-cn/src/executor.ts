@@ -169,6 +169,7 @@ async function execSearch(call: ToolCall): Promise<Record<string, unknown>> {
 // ---- 写类 ----
 async function execWriteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
   const args = parseArgs(call)
+  if (!args.path) return { ok: false, error: 'AI 调用 write_file 时未提供 path 参数，请重新描述任务' }
   const pathRel = normalizeRel(args.path)
   let oldContent = ''
   try { oldContent = await readText(toUri(pathRel)) } catch { /* 新文件 */ }
@@ -218,6 +219,7 @@ function applyEdits(content: string, edits: Array<{ search: string; replace: str
 
 async function execEditFile(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
   const args = parseArgs(call)
+  if (!args.path) return { ok: false, error: 'AI 调用 edit_file 时未提供 path 参数，请重新描述任务' }
   const pathRel = normalizeRel(args.path)
   let content: string
   try { content = await readText(toUri(pathRel)) }
@@ -245,6 +247,7 @@ async function execEditFile(call: ToolCall, hooks: ExecHooks): Promise<Record<st
 async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
   const args = parseArgs(call)
   const command = String(args.command || '')
+  if (!command) return { ok: false, error: 'AI 调用 run_command 时未提供 command 参数' }
   const danger = DANGER_RE.test(command)
   hooks.setStatus('awaiting')
   const apr = await hooks.requestApproval({
