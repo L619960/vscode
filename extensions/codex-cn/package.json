@@ -1,0 +1,97 @@
+{
+  "name": "codex-cn",
+  "displayName": "Codex CN",
+  "description": "国产 AI 编程助手：Agent 工具调用 + Diff 审批，内置豆包/DeepSeek/通义/Kimi/智谱",
+  "version": "1.0.0",
+  "publisher": "vscode",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.140.0"
+  },
+  "main": "./out/extension",
+  "extensionKind": ["ui"],
+  "activationEvents": [],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "AI 文件操作与命令执行需要受信任的工作区"
+    }
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codex-cn",
+          "title": "Codex CN",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codex-cn": [
+        {
+          "id": "codex-cn.chat",
+          "name": "对话",
+          "type": "webview",
+          "contextualTitle": "Codex CN"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codexCN.focus",
+        "title": "聚焦 Codex CN",
+        "category": "Codex CN"
+      },
+      {
+        "command": "codexCN.openSettings",
+        "title": "模型接入设置",
+        "category": "Codex CN"
+      }
+    ],
+    "configuration": {
+      "title": "Codex CN",
+      "properties": {
+        "codex-cn.provider": {
+          "type": "string",
+          "default": "doubao",
+          "enum": ["doubao", "deepseek", "qwen", "kimi", "zhipu", "openai", "llama", "ollama", "custom"],
+          "enumDescriptions": ["豆包", "DeepSeek", "通义千问", "Kimi", "智谱", "OpenAI", "llama.cpp", "Ollama", "自定义"],
+          "description": "模型提供商"
+        },
+        "codex-cn.baseUrl": {
+          "type": "string",
+          "default": "https://ark.cn-beijing.volces.com/api/v3",
+          "description": "API Base URL（OpenAI 兼容）"
+        },
+        "codex-cn.model": {
+          "type": "string",
+          "default": "doubao-pro-32k",
+          "description": "模型名称"
+        },
+        "codex-cn.supportsTools": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "yes", "no"],
+          "enumDescriptions": ["自动检测（400 自动降级）", "强制启用工具调用", "关闭（纯对话）"],
+          "description": "工具调用支持"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "gulp compile-extension:codex-cn && npm run build-webview",
+    "watch": "npm run build-webview && gulp watch-extension:codex-cn",
+    "build-ext": "node ../../node_modules/gulp/bin/gulp.js --gulpfile ../../build/gulpfile.extensions.mjs compile-extension:codex-cn ./tsconfig.json",
+    "build-webview": "node ./esbuild.webview.mts"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@types/node": "24.x",
+    "@types/vscode": "^1.138.0",
+    "esbuild": "0.28.2",
+    "esbuild-plugin-vue3": "^0.5.0"
+  }
+}
