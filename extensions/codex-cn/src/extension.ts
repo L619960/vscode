@@ -164,6 +164,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private getHtml(webview: vscode.Webview): string {
     const script = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview.js'))
+    const styles = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview.css'))
     const nonce = getNonce()
     return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -171,6 +172,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 <meta charset="UTF-8" />
 <meta http-equiv="Content-Security-Policy"
   content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src ${webview.cspSource} https: data:;" />
+<link rel="stylesheet" href="${styles}" />
 </head>
 <body>
   <div id="app"></div>
