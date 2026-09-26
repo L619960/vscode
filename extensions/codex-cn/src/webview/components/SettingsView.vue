@@ -10,6 +10,7 @@ const baseUrl = ref('')
 const modelName = ref('')
 const supportsTools = ref('auto')
 const autoApprove = ref(false)
+const tabCompletion = ref(true)
 const apiKey = ref('')
 const hasKey = ref(false)
 const presets = ref<Record<string, string>>({})
@@ -24,6 +25,7 @@ onMounted(() => {
       modelName.value = d.model
       supportsTools.value = d.supportsTools
       autoApprove.value = !!d.autoApprove
+      tabCompletion.value = d.tabCompletion !== false
       hasKey.value = d.hasKey
       presets.value = d.presets
     } else if (e.data?.type === 'configSaved') {
@@ -41,7 +43,7 @@ function save(): void {
     patch: {
       provider: provider.value, baseUrl: baseUrl.value.trim(),
       model: modelName.value.trim(), supportsTools: supportsTools.value,
-      autoApprove: autoApprove.value,
+      autoApprove: autoApprove.value, tabCompletion: tabCompletion.value,
       ...(apiKey.value.trim() ? { apiKey: apiKey.value.trim() } : {}),
     },
   })
@@ -78,6 +80,13 @@ function save(): void {
         <option value="yes">强制启用</option>
         <option value="no">关闭（纯对话）</option>
       </select>
+    </div>
+    <div class="field">
+      <label class="check-row">
+        <input type="checkbox" v-model="tabCompletion" />
+        <span>Tab 代码补全（编辑器内 AI 行内补全）</span>
+      </label>
+      <span class="hint">开启后在编辑器中按 Tab 接受 AI 补全建议</span>
     </div>
     <div class="field">
       <label class="check-row">

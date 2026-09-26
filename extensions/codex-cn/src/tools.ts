@@ -107,9 +107,23 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description: '搜索互联网获取信息。用于查找文档、API 用法、错误解决方案等。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索关键词' },
+        },
+        required: ['query'],
+      },
+    },
+  },
 ]
 
-export const READ_TOOLS = new Set(['list_dir', 'read_file', 'search_files'])
+export const READ_TOOLS = new Set(['list_dir', 'read_file', 'search_files', 'web_search'])
 export const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'run_command'])
 
 export function summarizeArgs(name: string, args: Record<string, unknown>): string {
@@ -125,6 +139,8 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
       return String(args.command || '')
     case 'search_files':
       return `"${args.query || ''}"${args.path ? ` in ${args.path}` : ''}`
+    case 'web_search':
+      return String(args.query || '')
     default:
       return JSON.stringify(args).slice(0, 80)
   }
@@ -146,6 +162,8 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
       return `退出码 ${result.code ?? 0}`
     case 'search_files':
       return `${(result.matches as unknown[])?.length ?? 0} 处匹配${result.truncated ? '（已截断）' : ''}`
+    case 'web_search':
+      return `${result.count ?? 0} 条结果`
     default:
       return '完成'
   }

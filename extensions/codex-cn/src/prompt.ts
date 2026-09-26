@@ -1,7 +1,23 @@
 // Agent 系统提示词
 
-export function buildSystemPrompt(workspaceName: string, dirSummary: string): string {
-  return `你是 Codex CN，一个 AI 编程助手，运行在用户的 Windows 桌面上（VS Code 内核）。
+import * as vscode from 'vscode'
+
+/** 读取 .codexcrules 项目规则；不存在时回退到 .cursorrules */
+export async function loadProjectRules(workspaceRoot: string): Promise<string> {
+  for (const name of ['.codexcrules', '.cursorrules']) {
+    try {
+      const rulesUri = vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), name)
+      const content = await vscode.workspace.fs.readFile(rulesUri)
+      return Buffer.from(content).toString('utf-8').trim()
+    } catch {
+      // 文件不存在或不可读，尝试下一个
+    }
+  }
+  return ''
+}
+
+export async function buildSystemPrompt(workspaceName: string, dirSummary: string, workspaceRoot?: string): Promise<string> {
+  let systemPrompt = `你是 Codex CN，一个 AI 编程助手，运行在用户的 Windows 桌面上（VS Code 内核）。
 
 ## 环境
 - 操作系统：Windows，命令行是 cmd（不是 bash，不要用 ls/pwd/rm 等 Unix 命令）
@@ -18,4 +34,14 @@ ${dirSummary || '（尚未加载，可用 list_dir 探索）'}
 4. 文件修改和命令执行需要用户批准，被拒绝时根据用户给出的原因调整方案
 5. 不要执行交互式命令（如需要输入的命令）；命令有 30 秒超时
 6. 一次任务分多步完成，每步用工具验证结果；完成后用中文简要总结改动`
+
+  // 项目规则
+  if (workspaceRoot) {
+    const rules = await loadProjectRules(workspaceRoot)
+    if (rules) {
+      systemPrompt += `\n\n## 项目规则\n${rules}`
+    }
+  }
+
+  return systemPrompt
 }

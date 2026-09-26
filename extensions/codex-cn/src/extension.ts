@@ -4,6 +4,9 @@ import * as vscode from 'vscode'
 import { Session } from './session.js'
 import { runAgent, type AgentDeps } from './runAgent.js'
 import { getApiKey, saveApiKey, getProvider, applyProviderPreset, setConfig, PROVIDER_PRESETS } from './config.js'
+import { registerTabCompletion } from './tabCompletion.js'
+import { registerInlineEdit } from './inlineEdit.js'
+import { getCheckpoints, restoreCheckpoint, clearCheckpoints } from './checkpoints.js'
 import type { ApprovalDecision, ApprovalRequest } from './executor.js'
 
 let session: Session
@@ -33,9 +36,14 @@ function activate(context: vscode.ExtensionContext): void {
     void vscode.commands.executeCommand('codex-cn.chat.focus')
   }
 
+  registerTabCompletion(context)
+
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider('codexcn-diff', diffProvider)
   )
+
+  // Ctrl+K 行内编辑：复用 codexcn-diff 供应器做修改预览
+  registerInlineEdit(context, diffProvider)
 
   const openDiff = (req: ApprovalRequest): void => {
     const left = vscode.Uri.parse(`codexcn-diff:///${req.path || 'file'}?old&t=${Date.now()}`)
@@ -68,44 +76,71 @@ function activate(context: vscode.ExtensionContext): void {
     async send(text: string) {
       if (cancelSource) return
       cancelSource = new vscode.CancellationTokenSource()
-      postToWebview({ type: 'state', messages: session.messages, running: true })
+      postToWebview({ type: 'state', messages: session.messages, running: true, checkpoints: getCheckpoints().length })
       const deps: AgentDeps = {
         session,
         getApiKey: () => getApiKey(context.secrets),
         requestApproval,
-        onChange: () => postToWebview({ type: 'state', messages: session.messages, running: cancelSource !== null }),
+        onChange: () => postToWebview({ type: 'state', messages: session.messages, running: cancelSource !== null, checkpoints: getCheckpoints().length }),
       }
       await runAgent(text, deps, cancelSource.token)
       cancelSource = null
-      postToWebview({ type: 'state', messages: session.messages, running: false })
+      postToWebview({ type: 'state', messages: session.messages, running: false, checkpoints: getCheckpoints().length })
     },
     stop() {
       cancelSource?.cancel()
       cancelSource = null
       // 释放所有待审批 Promise（按拒绝处理）
       for (const [id, resolve] of pending) { resolve({ decision: 'deny', reason: '用户停止了任务' }); pending.delete(id) }
-      postToWebview({ type: 'state', messages: session.messages, running: false })
+      postToWebview({ type: 'state', messages: session.messages, running: false, checkpoints: getCheckpoints().length })
     },
-    clear() { session.clear(); postToWebview({ type: 'state', messages: session.messages, running: false }) },
+    clear() {
+      session.clear()
+      clearCheckpoints()
+      postToWebview({ type: 'state', messages: session.messages, running: false, checkpoints: 0 })
+    },
+    // 回滚：弹出快照列表（最新在前），选中后恢复对应文件
+    async rollback() {
+      const list = getCheckpoints()
+      if (!list.length) {
+        void vscode.window.showInformationMessage('暂无可回滚的快照')
+        return
+      }
+      const items = list.map((cp, index) => ({
+        label: cp.file,
+        description: new Date(cp.timestamp).toLocaleTimeString('zh-CN'),
+        detail: cp.content === '' ? '快照时文件不存在，回滚将删除该文件' : '恢复该文件到快照时的内容',
+        index,
+      })).reverse()
+      const picked = await vscode.window.showQuickPick(items, { placeHolder: '选择要恢复的快照（仅恢复对应文件）' })
+      if (!picked) return
+      try {
+        await restoreCheckpoint(picked.index)
+        void vscode.window.showInformationMessage(`已回滚：${picked.label}`)
+      } catch (e) {
+        void vscode.window.showErrorMessage(`回滚失败: ${(e as Error).message}`)
+      }
+    },
     async getConfig() {
       const c = vscode.workspace.getConfiguration('codex-cn')
       const key = await getApiKey(context.secrets)
       return {
         provider: c.get('provider'), baseUrl: c.get('baseUrl'), model: c.get('model'),
-        supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), hasKey: !!key,
+        supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), tabCompletion: c.get('tabCompletion'), hasKey: !!key,
         presets: Object.fromEntries(Object.entries(PROVIDER_PRESETS).map(([k, v]) => [k, v.label])),
       }
     },
-    async saveConfig(patch: { provider?: string; baseUrl?: string; model?: string; supportsTools?: string; autoApprove?: boolean; apiKey?: string }) {
+    async saveConfig(patch: { provider?: string; baseUrl?: string; model?: string; supportsTools?: string; autoApprove?: boolean; tabCompletion?: boolean; apiKey?: string }) {
       if (patch.provider && patch.provider !== getProvider()) {
         await setConfig({ provider: patch.provider })
         await applyProviderPreset(patch.provider)
       }
-      const rest: Partial<{ baseUrl: string; model: string; supportsTools: string; autoApprove: boolean }> = {}
+      const rest: Partial<{ baseUrl: string; model: string; supportsTools: string; autoApprove: boolean; tabCompletion: boolean }> = {}
       if (patch.baseUrl !== undefined) rest.baseUrl = patch.baseUrl
       if (patch.model !== undefined) rest.model = patch.model
       if (patch.supportsTools !== undefined) rest.supportsTools = patch.supportsTools
       if (patch.autoApprove !== undefined) rest.autoApprove = patch.autoApprove
+      if (patch.tabCompletion !== undefined) rest.tabCompletion = patch.tabCompletion
       if (Object.keys(rest).length) await setConfig(rest)
       if (patch.apiKey) await saveApiKey(context.secrets, patch.apiKey)
     },
@@ -141,6 +176,7 @@ interface Bridge {
   send(text: string): Promise<void>
   stop(): void
   clear(): void
+  rollback(): Promise<void>
   getConfig(): Promise<unknown>
   saveConfig(patch: unknown): Promise<void>
   onDecision(d: unknown): void
@@ -161,14 +197,49 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     view.webview.onDidReceiveMessage(async (msg: any) => {
       switch (msg.type) {
         case 'ready':
-          view.webview.postMessage({ type: 'state', messages: this.bridge.getMessages(), running: this.bridge.running() })
+          view.webview.postMessage({ type: 'state', messages: this.bridge.getMessages(), running: this.bridge.running(), checkpoints: getCheckpoints().length })
           break
         case 'send': await this.bridge.send(String(msg.text || '')); break
         case 'stop': this.bridge.stop(); break
         case 'clear': this.bridge.clear(); break
+        case 'rollback': await this.bridge.rollback(); break
         case 'getConfig': view.webview.postMessage({ type: 'config', data: await this.bridge.getConfig() }); break
         case 'saveConfig': await this.bridge.saveConfig(msg.patch); view.webview.postMessage({ type: 'configSaved' }); break
         case 'decision': this.bridge.onDecision(msg); break
+        case 'getWorkspaceFiles': {
+          const folder = vscode.workspace.workspaceFolders?.[0]
+          if (!folder) {
+            view.webview.postMessage({ type: 'workspaceFiles', seq: msg.seq, files: [] })
+            break
+          }
+          // 去掉 glob 特殊字符，防止查询串破坏匹配模式
+          const query = String(msg.query || '').replace(/[*?{}\[\]\\]/g, '').slice(0, 100)
+          // 含 / 时按路径前缀匹配；否则同时匹配文件名与目录名（目录下的文件用于推导目录候选）
+          const pattern = query
+            ? query.includes('/') ? `**/${query}*` : `{**/*${query}*,**/*${query}*/**}`
+            : '**/*'
+          const rawFiles = await vscode.workspace.findFiles(pattern, '**/node_modules/**', 50)
+          const skipRe = /(^|[\\/])(node_modules|\.git|dist|out)([\\/]|$)/i
+          const files: string[] = []
+          const dirs = new Set<string>()
+          const q = query.toLowerCase()
+          for (const f of rawFiles) {
+            const rel = vscode.workspace.asRelativePath(f, false).replace(/\\/g, '/')
+            if (skipRe.test(rel)) continue
+            files.push(rel)
+            // 目录前缀也作为候选，支持 @文件夹/ 引用
+            const parts = rel.split('/')
+            let prefix = ''
+            for (let i = 0; i < parts.length - 1; i++) {
+              prefix = prefix ? `${prefix}/${parts[i]}` : parts[i]
+              if (q && !prefix.toLowerCase().includes(q) && !q.startsWith(prefix.toLowerCase() + '/')) continue
+              dirs.add(prefix + '/')
+            }
+          }
+          const list = [...dirs, ...files].slice(0, 50)
+          view.webview.postMessage({ type: 'workspaceFiles', seq: msg.seq, files: list })
+          break
+        }
       }
     })
   }

@@ -47,6 +47,18 @@
         "command": "codexCN.openSettings",
         "title": "模型接入设置",
         "category": "Codex CN"
+      },
+      {
+        "command": "codex-cn.inlineEdit",
+        "title": "行内编辑（选中代码后按 Ctrl+K）",
+        "category": "Codex CN"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "codex-cn.inlineEdit",
+        "key": "ctrl+k",
+        "when": "editorTextFocus && editorHasSelection"
       }
     ],
     "configuration": {
@@ -80,6 +92,11 @@
           "type": "boolean",
           "default": false,
           "description": "自动审批：AI 写文件/编辑/运行命令不再询问（请谨慎开启）"
+        },
+        "codex-cn.tabCompletion": {
+          "type": "boolean",
+          "default": true,
+          "description": "Tab 代码补全：在编辑器中触发 AI 行内代码补全"
         }
       }
     }

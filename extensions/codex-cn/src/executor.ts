@@ -5,6 +5,8 @@ import { exec as cpExec } from 'node:child_process'
 import { promisify } from 'node:util'
 import * as vscode from 'vscode'
 import { READ_TOOLS, WRITE_TOOLS, summarizeArgs } from './tools.js'
+import { saveCheckpoint } from './checkpoints.js'
+import { webSearch } from './webSearch.js'
 import type { ToolCall } from './types.js'
 
 const execPromise = promisify(cpExec)
@@ -166,6 +168,20 @@ async function execSearch(call: ToolCall): Promise<Record<string, unknown>> {
   }
 }
 
+/** 联网搜索：无需审批，网络失败转为错误结果回喂给 AI */
+async function execWebSearch(call: ToolCall): Promise<Record<string, unknown>> {
+  const args = parseArgs(call)
+  const query = String(args.query || '').trim()
+  if (!query) return { ok: false, error: 'AI 调用 web_search 时未提供 query 参数' }
+  try {
+    const results = await webSearch(query)
+    if (!results) return { ok: true, query, count: 0, results: '', note: '未找到相关结果，可换关键词重试' }
+    return { ok: true, query, count: results.split('\n\n').length, results }
+  } catch (e) {
+    return { ok: false, error: `联网搜索失败: ${(e as Error).message}` }
+  }
+}
+
 // ---- 写类 ----
 async function execWriteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
   const args = parseArgs(call)
@@ -182,6 +198,8 @@ async function execWriteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<s
     return { ok: false, error: `用户拒绝了写入 ${pathRel}${result.reason ? '：' + result.reason : ''}` }
   }
   try {
+    // 写入前保存快照，供「回滚」恢复
+    await saveCheckpoint(toUri(pathRel).fsPath)
     await vscode.workspace.fs.writeFile(toUri(pathRel), new TextEncoder().encode(String(args.content ?? '')))
     return { ok: true, path: pathRel, bytes: new TextEncoder().encode(String(args.content ?? '')).length }
   } catch (e) {
@@ -237,6 +255,8 @@ async function execEditFile(call: ToolCall, hooks: ExecHooks): Promise<Record<st
     return { ok: false, error: `用户拒绝了编辑 ${pathRel}${apr.reason ? '：' + apr.reason : ''}` }
   }
   try {
+    // 写入前保存快照，供「回滚」恢复
+    await saveCheckpoint(toUri(pathRel).fsPath)
     await vscode.workspace.fs.writeFile(toUri(pathRel), new TextEncoder().encode(editRes.text))
     return { ok: true, path: pathRel, edits_applied: editRes.edits_applied }
   } catch (e) {
@@ -287,6 +307,7 @@ export async function executeToolCall(call: ToolCall, hooks: ExecHooks): Promise
       case 'list_dir': return execListDir(call)
       case 'read_file': return execRead(call)
       case 'search_files': return execSearch(call)
+      case 'web_search': return execWebSearch(call)
     }
   }
   if (WRITE_TOOLS.has(name)) {

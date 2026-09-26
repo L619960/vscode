@@ -42,7 +42,7 @@ export async function applyProviderPreset(provider: string): Promise<void> {
   await c.update('model', preset.model, vscode.ConfigurationTarget.Global)
 }
 
-export function setConfig(patch: Partial<{ provider: string; baseUrl: string; model: string; supportsTools: string; autoApprove: boolean }>): Thenable<void> {
+export function setConfig(patch: Partial<{ provider: string; baseUrl: string; model: string; supportsTools: string; autoApprove: boolean; tabCompletion: boolean }>): Thenable<void> {
   const c = cfg()
   const strTargets: Array<[string, string]> = []
   const boolTargets: Array<[string, boolean]> = []
@@ -51,6 +51,7 @@ export function setConfig(patch: Partial<{ provider: string; baseUrl: string; mo
   if (patch.model !== undefined) strTargets.push(['model', patch.model])
   if (patch.supportsTools !== undefined) strTargets.push(['supportsTools', patch.supportsTools])
   if (patch.autoApprove !== undefined) boolTargets.push(['autoApprove', patch.autoApprove])
+  if (patch.tabCompletion !== undefined) boolTargets.push(['tabCompletion', patch.tabCompletion])
   return Promise.all([
     ...strTargets.map(([k, v]) => c.update(k, v, vscode.ConfigurationTarget.Global)),
     ...boolTargets.map(([k, v]) => c.update(k, v, vscode.ConfigurationTarget.Global)),
