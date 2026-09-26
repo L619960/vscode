@@ -255,7 +255,7 @@ export interface IProductConfiguration {
 		readonly excludeVersionRange?: string;
 	}>;
 	readonly extensionsForceVersionByQuality?: readonly string[];
-	readonly builtInExtensionsEnabledWithAutoUpdates: readonly string[];
+	readonly builtInExtensionsEnabledWithAutoUpdates?: readonly string[];
 	readonly sessionsWindowAllowedExtensions?: readonly string[];
 
 	readonly msftInternalDomains?: string[];

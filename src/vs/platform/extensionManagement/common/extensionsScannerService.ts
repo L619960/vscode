@@ -110,12 +110,14 @@ interface IBuiltInExtensionControl {
 
 function getProductBuiltInExtensionsEnabledWithAutoUpdates(productService: IProductService, environmentService: IEnvironmentService): Set<string> {
 	const result = new Set<string>();
-	for (const id of productService.builtInExtensionsEnabledWithAutoUpdates) {
-		const toLowerCaseId = id.toLowerCase();
-		if (environmentService.skipBuiltinExtensions?.some(skipId => skipId.toLowerCase() === toLowerCaseId)) {
-			continue;
+	if (productService.builtInExtensionsEnabledWithAutoUpdates) {
+		for (const id of productService.builtInExtensionsEnabledWithAutoUpdates) {
+			const toLowerCaseId = id.toLowerCase();
+			if (environmentService.skipBuiltinExtensions?.some(skipId => skipId.toLowerCase() === toLowerCaseId)) {
+				continue;
+			}
+			result.add(toLowerCaseId);
 		}
-		result.add(toLowerCaseId);
 	}
 	return result;
 }
