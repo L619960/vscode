@@ -51,7 +51,7 @@ export async function chatCompletion(opts: {
       model: config.model,
       messages,
       stream: true,
-      max_tokens: 4096,
+      max_tokens: 16384,
       ...(withTools && tools?.length ? { tools, tool_choice: 'auto' } : {}),
     })
 
