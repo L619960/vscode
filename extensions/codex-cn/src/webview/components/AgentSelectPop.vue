@@ -34,10 +34,10 @@ function onSelect(item: typeof list.value[0]): void {
 
 <template>
   <div class="agent-mode-wrap">
-    <button class="mini-btn" @click="showPop = true">
-      <span>{{ selected === 'agent' ? '🤖' : '💬' }}</span>
-      <span>{{ list.find(i => i.value === selected)?.name || 'Agent' }}</span>
-      <svg class="arrow" width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>
+    <button class="text-btn" title="选择 Agent 类型" @click="showPop = true">
+      <span class="at-sign">@</span>
+      <span class="at-name">{{ selected === 'agent' ? 'Agent' : 'Chat' }}</span>
+      <svg class="chev" width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>
     </button>
 
     <van-popup

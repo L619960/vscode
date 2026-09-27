@@ -265,10 +265,15 @@ onMounted(() => {
       running.value = m.running
       checkpoints.value = m.checkpoints ?? 0
       todos.value = m.todos || []
+      if (m.sessions) sessions.value = m.sessions
+      if (m.activeId !== undefined) activeId.value = m.activeId
       if (todos.value.length) planClosed.value = false
       // 清理已完成审批
       approvals.value = approvals.value.filter((a) => !!findAwaitingRun(a.toolName, a.argsSummary))
       attachApprovals()
+    } else if (m.type === 'sessions') {
+      sessions.value = m.sessions || []
+      activeId.value = m.activeId
     } else if (m.type === 'approval') {
       const { type, id, ...req } = m
       approvals.value.push({ id, ...(req as Omit<Approval, 'id'>), runKey: '' })
@@ -282,9 +287,26 @@ onMounted(() => {
       modelNames.value = d.presetModels || {}
       currentProvider.value = d.provider || ''
       currentModel.value = d.model || ''
+    } else if (m.type === 'promptOptimized') {
+      optimizing.value = false
+      if (m.error) {
+        toast.value = '优化失败：' + String(m.error).slice(0, 120)
+      } else if (m.text) {
+        input.value = String(m.text)
+        void nextTick(() => textareaEl.value?.focus())
+        toast.value = '提示词已优化'
+      }
+      setTimeout(() => { toast.value = '' }, 2500)
+    } else if (m.type === 'skills') {
+      // seq=0 是挂载时的技能缓存（供输入框「/」使用）；其他 seq 忽略
+      if (m.seq === 0) skillCache.value = m.items || []
+    } else if (m.type === 'skillsChanged') {
+      // 设置页改动了技能：实时重新拉取缓存
+      vscodeApi.postMessage({ type: 'listSkills', seq: 0 })
     }
   })
   vscodeApi.postMessage({ type: 'getConfig' })
+  vscodeApi.postMessage({ type: 'listSkills', seq: 0 })
 })
 
 function send(): void {
@@ -301,6 +323,41 @@ function clearHistory(): void {
 }
 // 回滚：由扩展弹原生 QuickPick 选择快照并恢复
 function rollback(): void { vscodeApi.postMessage({ type: 'rollback' }) }
+
+// ---- 多会话：新建 / 历史 / 切换 / 删除 ----
+interface SessionItem { id: string; title: string; createdAt: number; updatedAt: number }
+const sessions = ref<SessionItem[]>([])
+const activeId = ref('')
+const showHistory = ref(false)
+const confirmDeleteId = ref('')
+
+function newSession(): void {
+  // 正在运行的任务由扩展端先停止再新建（前端无需拦截）
+  showHistory.value = false
+  vscodeApi.postMessage({ type: 'newSession' })
+}
+function openHistoryItem(id: string): void {
+  if (id === activeId.value) { showHistory.value = false; return }
+  confirmDeleteId.value = ''
+  vscodeApi.postMessage({ type: 'openSession', id })
+  showHistory.value = false
+}
+function askDelete(id: string): void { confirmDeleteId.value = id }
+function doDelete(id: string): void {
+  vscodeApi.postMessage({ type: 'deleteSession', id })
+  confirmDeleteId.value = ''
+}
+/** 相对时间：x分钟前 / x小时前 / 月-日（跨年加年份） */
+function relTime(ts: number): string {
+  const diff = Date.now() - ts
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`
+  const d = new Date(ts)
+  const sameYear = d.getFullYear() === new Date().getFullYear()
+  const md = `${d.getMonth() + 1}月${d.getDate()}日`
+  return sameYear ? md : `${d.getFullYear()}年${md}`
+}
 
 // ---- 消息操作：复制 / 修改 / 回退 / 删除 ----
 const copiedIdx = ref(-1)
@@ -329,32 +386,55 @@ function deleteMsg(idx: number): void {
   vscodeApi.postMessage({ type: 'truncateMessages', index: idx - 1 })
 }
 
-// ---- @ 文件/文件夹引用 ----
+// ---- @ 文件/文件夹引用 + / 技能 ----
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const references = ref<string[]>([])
 const dropdownOpen = ref(false)
+/** 下拉内容类型：文件引用 or 技能 */
+const dropdownKind = ref<'file' | 'skill'>('file')
 const fileItems = ref<string[]>([])
+/** 技能缓存（挂载时拉取；设置页改动后重新拉取） */
+const skillCache = ref<Array<{ name: string; title: string; preview: string; content: string }>>([])
+/** 技能下拉当前展示的条目（按输入过滤） */
+const skillItems = ref<typeof skillCache.value>([])
 const activeIndex = ref(0)
 const mentionStart = ref(-1)
 let fileSeq = 0
 let fileTimer: number | undefined
 
-/** 输入 / 点击：检测光标前是否处于 @引用 输入中，是则向后端请求文件列表 */
+/** 输入 / 点击：检测光标前是否处于 @引用 或 /技能 输入中 */
 function onInput(): void {
   const el = textareaEl.value
   if (!el) return
   const pos = el.selectionStart
-  const m = input.value.slice(0, pos).match(/(?:^|\s)@([^\s@]*)$/)
-  if (m) {
-    mentionStart.value = pos - m[1].length - 1
+  const before = input.value.slice(0, pos)
+  const atM = before.match(/(?:^|\s)@([^\s@]*)$/)
+  const slashM = before.match(/(?:^|\s)\/([^\s/]*)$/)
+  if (atM) {
+    mentionStart.value = pos - atM[1].length - 1
+    dropdownKind.value = 'file'
     dropdownOpen.value = true
     activeIndex.value = 0
-    requestFiles(m[1])
+    requestFiles(atM[1])
+  } else if (slashM) {
+    mentionStart.value = pos - slashM[1].length - 1
+    dropdownKind.value = 'skill'
+    const q = slashM[1].toLowerCase()
+    skillItems.value = skillCache.value.filter(
+      (s) => !q || s.title.toLowerCase().includes(q) || s.name.toLowerCase().includes(q),
+    )
+    dropdownOpen.value = true
+    activeIndex.value = 0
   } else {
     closeDropdown()
   }
   syncReferences()
 }
+
+/** 下拉条目总数（键盘导航用） */
+const dropdownCount = computed<number>(() =>
+  dropdownKind.value === 'file' ? fileItems.value.length : skillItems.value.length,
+)
 
 /** 防抖请求工作区文件列表 */
 function requestFiles(query: string): void {
@@ -368,6 +448,7 @@ function requestFiles(query: string): void {
 function closeDropdown(): void {
   dropdownOpen.value = false
   fileItems.value = []
+  skillItems.value = []
   mentionStart.value = -1
 }
 
@@ -384,6 +465,24 @@ function pickFile(path: string): void {
   void nextTick(() => {
     el.focus()
     el.setSelectionRange(before.length + token.length, before.length + token.length)
+  })
+}
+
+/** 选中技能：把 /query 替换为技能模板完整内容（真实文件内容） */
+function pickSkill(item: { name: string; content: string }): void {
+  const el = textareaEl.value
+  if (!el || mentionStart.value < 0) return
+  const before = input.value.slice(0, mentionStart.value)
+  const after = input.value.slice(el.selectionStart)
+  const body = item.content.trimEnd()
+  // 保留前后各一个换行，让技能内容与后续补充文本分隔
+  const token = (before && !before.endsWith('\n') ? '\n' : '') + body + '\n'
+  input.value = before + token + after
+  closeDropdown()
+  void nextTick(() => {
+    el.focus()
+    const caret = before.length + token.length
+    el.setSelectionRange(caret, caret)
   })
 }
 
@@ -414,10 +513,16 @@ function onKeydown(e: KeyboardEvent): void {
   if (e.isComposing) return
   if (dropdownOpen.value) {
     if (e.key === 'Escape') { e.preventDefault(); closeDropdown(); return }
-    if (fileItems.value.length) {
-      if (e.key === 'ArrowDown') { e.preventDefault(); activeIndex.value = (activeIndex.value + 1) % fileItems.value.length; return }
-      if (e.key === 'ArrowUp') { e.preventDefault(); activeIndex.value = (activeIndex.value - 1 + fileItems.value.length) % fileItems.value.length; return }
-      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickFile(fileItems.value[activeIndex.value]); return }
+    const count = dropdownCount.value
+    if (count) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); activeIndex.value = (activeIndex.value + 1) % count; return }
+      if (e.key === 'ArrowUp') { e.preventDefault(); activeIndex.value = (activeIndex.value - 1 + count) % count; return }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault()
+        if (dropdownKind.value === 'file') pickFile(fileItems.value[activeIndex.value])
+        else pickSkill(skillItems.value[activeIndex.value])
+        return
+      }
     }
   }
   if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
@@ -445,7 +550,9 @@ const statusText = computed(() => (running.value ? '停止' : '发送'))
 // 自动滚动到底部
 // ---- Agent 模式 + 模型选择 ----
 const agentMode = ref<'chat' | 'agent'>('agent')
+const composerFocused = ref(false)
 const showModelPop = ref(false)
+const toast = ref('')
 const modelPresets = ref<Record<string, string>>({})
 const modelNames = ref<Record<string, string>>({})
 const currentProvider = ref('')
@@ -455,6 +562,22 @@ function selectModel(key: string): void {
   currentModel.value = modelNames.value[key] || ''
   showModelPop.value = false
   vscodeApi.postMessage({ type: 'saveConfig', patch: { provider: key } })
+}
+/** 模型按钮短名（参考图显示 Auto 风格）：取末段，超长省略 */
+const modelShort = computed(() => {
+  const m = currentModel.value
+  if (!m) return 'Auto'
+  const last = m.split(/[\\/]/).pop() || m
+  return last.length > 14 ? last.slice(0, 12) + '…' : last
+})
+
+// ---- 提示词优化（✨）：调当前模型改写输入框内容并回填 ----
+const optimizing = ref(false)
+function optimizePrompt(): void {
+  const text = input.value.trim()
+  if (!text || optimizing.value || running.value) return
+  optimizing.value = true
+  vscodeApi.postMessage({ type: 'optimizePrompt', text })
 }
 
 const msgListEl = ref<HTMLElement | null>(null)
@@ -486,6 +609,32 @@ watch(running, (now, prev) => {
 
 <template>
   <div class="chat-view">
+    <!-- 头部：品牌 + 新建会话 / 历史任务 -->
+    <div class="chat-header">
+      <span class="brand">Codex&nbsp;CN</span>
+      <div class="header-tools">
+        <button class="hdr-btn" title="新建会话" @click="newSession">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.3 8.6 8.6 0 0 1-3.8-.9L3 21l1.9-5.4a8 8 0 0 1-.4-2.6A8.4 8.4 0 0 1 12.5 4.7 8.4 8.4 0 0 1 21 11.5z"/>
+            <path d="M12 9v5M9.5 11.5h5"/>
+          </svg>
+        </button>
+        <button class="hdr-btn" title="历史任务" @click="showHistory = true">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3.3 7a9 9 0 1 1-1 8.5"/><path d="M3.3 3.5V7h3.5"/>
+            <path d="M12 8v4.2l3 1.8"/>
+          </svg>
+        </button>
+        <button class="hdr-btn" title="设置（在编辑器标签页打开）"
+          @click="vscodeApi.postMessage({ type: 'openSettingsTab' })">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
     <div class="msg-list" ref="msgListEl">
       <!-- AI 任务规划（todo_write 驱动） -->
       <div v-if="todos.length" class="plan-card">
@@ -688,7 +837,13 @@ watch(running, (now, prev) => {
       </div>
     </div>
 
-    <div class="input-area">
+    <!-- 清空 / 回滚（容器外的辅助操作） -->
+    <div v-if="messages.length" class="composer-extra">
+      <button class="link" @click="clearHistory">清空对话</button>
+      <button v-if="checkpoints > 0" class="link no-push" @click="rollback">回滚({{ checkpoints }})</button>
+    </div>
+
+    <div class="composer" :class="{ focused: composerFocused }">
       <!-- @ 引用 chips -->
       <div v-if="references.length" class="ref-chips">
         <span v-for="r in references" :key="r" class="ref-chip">
@@ -696,44 +851,89 @@ watch(running, (now, prev) => {
           <button class="ref-x" title="移除引用" @click="removeReference(r)">×</button>
         </span>
       </div>
-      <textarea
-        ref="textareaEl"
-        v-model="input"
-        rows="3"
-        :placeholder="running ? 'AI 正在工作…' : '描述你的任务…（输入 @ 引用文件）'"
-        @input="onInput"
-        @click="onInput"
-        @keydown="onKeydown"
-      ></textarea>
-      <!-- @ 引用候选下拉（位于输入框下方） -->
-      <div v-if="dropdownOpen" class="ref-dropdown">
-        <div v-if="!fileItems.length" class="ref-item ref-empty">无匹配文件</div>
-        <div
-          v-for="(f, i) in fileItems" :key="f"
-          class="ref-item" :class="{ active: i === activeIndex }"
-          @mousedown.prevent="pickFile(f)"
-          @mouseenter="activeIndex = i"
+
+      <!-- 输入区：占位大文本 + 右上角闪光图标 -->
+      <div class="composer-input">
+        <textarea
+          ref="textareaEl"
+          v-model="input"
+          rows="2"
+          :placeholder="running ? 'AI 正在工作…' : '帮你编写代码、调试 Bug、优化性能等开发工作…'"
+          @focusin="composerFocused = true"
+          @focusout="composerFocused = false"
+          @input="onInput"
+          @click="onInput"
+          @keydown="onKeydown"
+        ></textarea>
+        <button
+          class="sparkle" :class="{ loading: optimizing }"
+          :title="optimizing ? '正在优化提示词…' : '优化提示词（AI 改写输入内容）'"
+          :disabled="!input.trim() || optimizing || running"
+          @click="optimizePrompt"
         >
-          <span class="ref-icon">{{ f.endsWith('/') ? '📁' : '📄' }}</span>
-          <span class="ref-path">{{ f }}</span>
-        </div>
-      </div>
-      <div class="input-bar">
-        <!-- 权限审批下拉 -->
-        <AgentPermissionPop />
-        <!-- Agent 类型选择下拉 -->
-        <AgentSelectPop @change="(m: 'chat'|'agent') => agentMode = m" />
-        <!-- 模型选择按钮 -->
-        <button class="mini-btn" title="模型配置" @click="showModelPop = true">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1v1a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-1H2a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2z"/></svg>
-          <span>{{ currentModel || '模型' }}</span>
-          <svg class="arrow" width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3c.3 3.5 1.8 5.4 5.5 6-3.7.6-5.2 2.5-5.5 6-.3-3.5-1.8-5.4-5.5-6 3.7-.6 5.2-2.5 5.5-6zM19 14c.1 1.4.7 2 2 2-1.3.1-1.9.7-2 2-.1-1.3-.7-1.9-2-2 1.3-.1 1.9-.7 2-2z"/></svg>
         </button>
-        <div class="spacer"></div>
-        <button class="link" @click="clearHistory">清空</button>
-        <button v-if="checkpoints > 0" class="link no-push" @click="rollback">回滚({{ checkpoints }})</button>
-        <button v-if="!running" class="btn primary" :disabled="!input.trim()" @click="send">发送</button>
-        <button v-else class="btn danger" @click="stop">■ 停止</button>
+      </div>
+
+      <!-- @ 文件 或 / 技能 候选下拉 -->
+      <div v-if="dropdownOpen" class="ref-dropdown">
+        <!-- 文件引用 -->
+        <template v-if="dropdownKind === 'file'">
+          <div v-if="!fileItems.length" class="ref-item ref-empty">无匹配文件</div>
+          <div
+            v-for="(f, i) in fileItems" :key="f"
+            class="ref-item" :class="{ active: i === activeIndex }"
+            @mousedown.prevent="pickFile(f)"
+            @mouseenter="activeIndex = i"
+          >
+            <span class="ref-icon">{{ f.endsWith('/') ? '📁' : '📄' }}</span>
+            <span class="ref-path">{{ f }}</span>
+          </div>
+        </template>
+        <!-- 技能 -->
+        <template v-else>
+          <div v-if="!skillItems.length" class="ref-item ref-empty">无匹配技能，可在设置中新建</div>
+          <div
+            v-for="(s, i) in skillItems" :key="s.name"
+            class="ref-item skill" :class="{ active: i === activeIndex }"
+            @mousedown.prevent="pickSkill(s)"
+            @mouseenter="activeIndex = i"
+          >
+            <span class="ref-icon">✨</span>
+            <span class="ref-path">
+              <span class="skill-title">{{ s.title }}</span>
+              <span class="skill-sub">{{ s.preview.slice(0, 40) }}</span>
+            </span>
+          </div>
+        </template>
+      </div>
+
+      <!-- 底部工具栏（容器内） -->
+      <div class="composer-bar">
+        <button class="icon-btn plus" title="添加（开发中）" type="button">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+        <!-- 权限审批 -->
+        <AgentPermissionPop />
+        <!-- Agent 类型 -->
+        <AgentSelectPop @change="(m: 'chat'|'agent') => agentMode = m" />
+        <span class="spacer"></span>
+        <!-- 模型选择 -->
+        <button class="text-btn model" title="选择模型" @click="showModelPop = true">
+          <span class="model-name">{{ modelShort }}</span>
+          <svg class="chev" width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>
+        </button>
+        <!-- 语音 -->
+        <button class="icon-btn mic" title="语音输入（开发中）" type="button">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></svg>
+        </button>
+        <!-- 发送 / 停止：绿色圆角方块 -->
+        <button v-if="!running" class="send-btn" :disabled="!input.trim()" title="发送" @click="send">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+        </button>
+        <button v-else class="send-btn stop" title="停止任务" @click="stop">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
       </div>
 
       <!-- 模型选择弹窗 -->
@@ -746,7 +946,7 @@ watch(running, (now, prev) => {
       >
         <div class="pop-header">
           <span class="pop-title">选择模型</span>
-          <a class="pop-link" @click="showModelPop = false; vscodeApi.postMessage({ type: 'openSettings' })">更多设置</a>
+          <a class="pop-link" @click="showModelPop = false; vscodeApi.postMessage({ type: 'openSettingsTab' })">更多设置</a>
         </div>
         <div class="pop-list">
           <div
@@ -764,6 +964,41 @@ watch(running, (now, prev) => {
           </div>
         </div>
       </van-popup>
+
+      <!-- 提示条（提示词优化结果） -->
+      <div v-if="toast" class="toast-bar">{{ toast }}</div>
+
+      <!-- 历史任务小卡片弹层（类似悬浮菜单） -->
+      <div v-if="showHistory" class="hist-card" @click="showHistory = false">
+        <div class="pop-header">
+          <span class="pop-title">历史任务</span>
+          <a class="pop-link" @click.stop="newSession">＋ 新建会话</a>
+        </div>
+        <div class="hist-list">
+          <div v-if="!sessions.length" class="hist-empty">暂无历史会话</div>
+          <div
+            v-for="s in sessions" :key="s.id"
+            class="hist-item" :class="{ active: s.id === activeId }"
+            @click.stop="openHistoryItem(s.id)"
+          >
+            <!-- 删除确认态 -->
+            <div v-if="confirmDeleteId === s.id" class="hist-confirm" @click.stop>
+              <span>删除该会话？</span>
+              <button class="hist-yes" @click.stop="doDelete(s.id)">删除</button>
+              <button class="hist-no" @click.stop="confirmDeleteId = ''">取消</button>
+            </div>
+            <template v-else>
+              <div class="hist-text">
+                <div class="hist-title">{{ s.title }}<span v-if="s.id === activeId" class="hist-badge">当前</span></div>
+                <div class="hist-time">{{ relTime(s.updatedAt) }}</div>
+              </div>
+              <button class="hist-del" title="删除会话" @click.stop="askDelete(s.id)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7h16M9 7V5h6v2M6.5 7l1 13h9l1-13"/></svg>
+              </button>
+            </template>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>

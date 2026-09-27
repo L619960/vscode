@@ -7,6 +7,7 @@ import { existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import * as vscode from 'vscode'
 import { READ_TOOLS, WRITE_TOOLS, BROWSER_TOOLS, PLAN_TOOLS, summarizeArgs } from './tools.js'
+import { getAgentSettings } from './config.js'
 import { saveCheckpoint } from './checkpoints.js'
 import { webSearch } from './webSearch.js'
 import type { TaskBoard, TaskCheckpoint } from './taskBoard.js'
@@ -571,9 +572,57 @@ async function execBrowser(call: ToolCall, deps: ToolDeps): Promise<Record<strin
   }
 }
 
+/** 联网工具名集合（工具开关与隐私模式共同作用于这些工具） */
+const WEB_TOOL_NAMES = new Set(['web_search', 'web_fetch'])
+/** 纯文件读取类（不含联网） */
+const FILE_READ_NAMES = new Set(['read_file', 'list_dir', 'search_files', 'glob', 'read_lints'])
+
+/**
+ * 工具策略闸门：实时读取设置，被禁用的工具不执行、直接返回错误结果。
+ * 返回非空字符串 = 拦截原因；空串 = 放行。
+ * 拦截结果会进入工具卡片并回喂 AI，形成真实闭环（不是仅 UI 禁用）。
+ */
+function blockedByPolicy(name: string | undefined, call: ToolCall): string {
+  if (!name) return ''
+  const s = getAgentSettings()
+
+  // 隐私模式：独立于工具开关，优先拦截联网，防止代码片段随搜索外发
+  if (s.privacyMode && WEB_TOOL_NAMES.has(name)) {
+    return '隐私模式已开启，已阻止本次联网请求（防止代码片段随搜索外发）。可在「设置 → 隐私模式」中关闭后重试'
+  }
+  if (WEB_TOOL_NAMES.has(name) && !s.toolWeb) {
+    return '联网工具（web_search / web_fetch）已在「设置 → 工具开关」中关闭，AI 无法联网'
+  }
+  if (FILE_READ_NAMES.has(name) && !s.toolRead) {
+    return '文件读取类工具已在「设置 → 工具开关」中关闭，AI 无法读取项目文件'
+  }
+  if ((name === 'write_file' || name === 'edit_file') && !s.toolWrite) {
+    return '文件写入类工具已在「设置 → 工具开关」中关闭，AI 无法修改任何文件'
+  }
+  if (name === 'run_command' && !s.toolShell) {
+    return '命令执行工具已在「设置 → 工具开关」中关闭，AI 无法执行系统命令'
+  }
+  if (name === 'await_shell') {
+    // start 受开关限制；logs/wait/stop/list 是管理操作，始终允许
+    const action = String(parseArgs(call).action || '')
+    if (action === 'start' && !s.toolShell) {
+      return '命令执行工具已在「设置 → 工具开关」中关闭，AI 无法启动后台进程'
+    }
+  }
+  if (BROWSER_TOOLS.has(name) && !s.toolBrowser) {
+    return '浏览器工具已在「设置 → 工具开关」中关闭，AI 无法操作浏览器'
+  }
+  return ''
+}
+
 /** 执行单个 tool_call */
 export async function executeToolCall(call: ToolCall, hooks: ExecHooks, deps: ToolDeps): Promise<Record<string, unknown>> {
   const name = call.function?.name
+
+  // ★策略闸门：工具开关 / 隐私模式（在审批与执行之前拦截）
+  const policyError = blockedByPolicy(name, call)
+  if (policyError) return { ok: false, error: policyError }
+
   if (READ_TOOLS.has(name)) {
     switch (name) {
       case 'list_dir': return execListDir(call)

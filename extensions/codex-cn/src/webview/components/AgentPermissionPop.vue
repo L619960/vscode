@@ -30,10 +30,18 @@ function onSelect(item: typeof list.value[0]): void {
 
 <template>
   <div class="permission-wrap">
-    <button class="mini-btn" @click="showPop = true">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"/></svg>
-      <span>{{ list.find(i => i.value === selected)?.title || '审批' }}</span>
-      <svg class="arrow" width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>
+    <button class="icon-btn" :title="list.find(i => i.value === selected)?.title || '审批模式'" @click="showPop = true">
+      <!-- 完全访问：绿色解锁盾牌；其余：橙色盾牌+感叹号（对齐参考图） -->
+      <svg v-if="selected === 'full'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="1.8" stroke-linejoin="round">
+        <path d="M12 2L4 5v6c0 5 3.4 9.2 8 11 4.6-1.8 8-6 8-11V5l-8-3z"/>
+        <path d="M9 12l2.2 2.2L16 9.5" stroke-linecap="round"/>
+      </svg>
+      <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e8912d" stroke-width="1.8" stroke-linejoin="round">
+        <path d="M12 2L4 5v6c0 5 3.4 9.2 8 11 4.6-1.8 8-6 8-11V5l-8-3z"/>
+        <path d="M12 8.2v4.4" stroke-linecap="round"/>
+        <circle cx="12" cy="15.6" r="0.6" fill="#e8912d" stroke="none"/>
+      </svg>
+      <svg class="chev" width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M7 10l5 5 5-5z"/></svg>
     </button>
 
     <van-popup

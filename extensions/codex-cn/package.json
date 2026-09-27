@@ -48,6 +48,21 @@
         "category": "Codex CN"
       },
       {
+        "command": "codex-cn.openChat",
+        "title": "打开 Codex CN 聊天",
+        "category": "Codex CN"
+      },
+      {
+        "command": "codex-cn.openAgentTab",
+        "title": "在编辑器标签页打开 Agent",
+        "category": "Codex CN"
+      },
+      {
+        "command": "codex-cn.openSettingsTab",
+        "title": "打开设置",
+        "category": "Codex CN"
+      },
+      {
         "command": "codexCN.openSettings",
         "title": "模型接入设置",
         "category": "Codex CN"
@@ -59,6 +74,11 @@
       }
     ],
     "keybindings": [
+      {
+        "command": "codex-cn.openChat",
+        "key": "ctrl+shift+l",
+        "when": "true"
+      },
       {
         "command": "codex-cn.inlineEdit",
         "key": "ctrl+k",
@@ -129,6 +149,55 @@
           "type": "boolean",
           "default": true,
           "description": "Tab 代码补全：在编辑器中触发 AI 行内代码补全"
+        },
+        "codex-cn.toolRead": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用文件读取类工具（read_file / list_dir / search_files / glob / read_lints）。关闭后 AI 调用这些工具会被真实拦截"
+        },
+        "codex-cn.toolWrite": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用文件写入类工具（write_file / edit_file）。关闭后 AI 将无法修改任何文件"
+        },
+        "codex-cn.toolShell": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用命令执行类工具（run_command / await_shell 启动）。关闭后 AI 将无法执行系统命令（后台进程的查看/停止等管理操作不受影响）"
+        },
+        "codex-cn.toolBrowser": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用浏览器工具（browser_*，基于系统 Edge）。关闭后 AI 无法操作浏览器"
+        },
+        "codex-cn.toolWeb": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用联网工具（web_search / web_fetch）。关闭后 AI 无法联网"
+        },
+        "codex-cn.privacyMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "隐私模式：阻止 web_search / web_fetch 联网请求，防止代码片段随搜索外发（与联网工具开关独立生效）"
+        },
+        "codex-cn.maxMessages": {
+          "type": "number",
+          "default": 100,
+          "minimum": 20,
+          "maximum": 500,
+          "description": "单个会话保留的消息条数，超出时最旧的消息不落盘"
+        },
+        "codex-cn.autoTitle": {
+          "type": "boolean",
+          "default": true,
+          "description": "首条用户消息自动生成会话标题；关闭后会话统一命名为「新会话」"
+        },
+        "codex-cn.maxSessions": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "maximum": 200,
+          "description": "历史会话保留上限，超出时最旧的会话被删除"
         }
       }
     }
