@@ -96,6 +96,9 @@ export interface ApprovalRequest {
   path?: string
   oldContent?: string
   newContent?: string
+  /** kind=ask 表示结构化提问（ask_user）：永远等用户，不走自动审批 */
+  kind?: 'tool' | 'ask'
+  options?: string[]
 }
 export interface ApprovalDecision {
   decision: 'allow' | 'deny'
@@ -432,6 +435,53 @@ async function execEditFile(call: ToolCall, hooks: ExecHooks): Promise<Record<st
   }
 }
 
+/** 删除文件/目录：防逃逸校验 → 审批 → 快照 → 删除 */
+async function execDeleteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
+  const args = parseArgs(call)
+  const pathRel = normalizeRel(String(args.path || ''))
+  if (!pathRel) return { ok: false, error: '禁止删除工作区根目录' }
+  const uri = toUri(pathRel)
+  let stat: vscode.FileStat
+  try { stat = await vscode.workspace.fs.stat(uri) }
+  catch { return { ok: false, error: `文件不存在: ${pathRel}` } }
+  const isDir = stat.type & vscode.FileType.Directory
+  if (isDir && !args.recursive) return { ok: false, error: `${pathRel} 是目录，需传 recursive=true 才能递归删除` }
+
+  hooks.setStatus('awaiting')
+  const apr = await hooks.requestApproval({
+    toolName: 'delete_file', argsSummary: pathRel, path: pathRel,
+  })
+  if (apr.decision !== 'allow') {
+    return { ok: false, error: `用户拒绝了删除 ${pathRel}${apr.reason ? '：' + apr.reason : ''}` }
+  }
+  try {
+    // 删除前保存快照（文件内容或目录内文件清单），供「回滚」恢复
+    await saveCheckpoint(uri.fsPath)
+    await vscode.workspace.fs.delete(uri, { recursive: !!args.recursive, useTrash: false })
+    return { ok: true, path: pathRel, deleted: true }
+  } catch (e) {
+    return { ok: false, error: `删除失败: ${(e as Error).message}` }
+  }
+}
+
+/** ask_user：向用户发起结构化提问，暂停等待回答（复用审批通道，永不被自动审批跳过） */
+async function execAskUser(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
+  const args = parseArgs(call)
+  const question = String(args.question || '').trim()
+  if (!question) return { ok: false, error: 'ask_user 缺少 question 参数' }
+  const options = (Array.isArray(args.options) ? args.options : [])
+    .map((o) => String(o).slice(0, 200)).filter(Boolean).slice(0, 4)
+
+  hooks.setStatus('awaiting')
+  const apr = await hooks.requestApproval({
+    toolName: 'ask_user', argsSummary: question, kind: 'ask', options,
+  })
+  if (apr.decision !== 'allow') {
+    return { ok: false, error: `用户未回答（${apr.reason || '停止了任务'}）` }
+  }
+  return { ok: true, answer: apr.reason || '' }
+}
+
 async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
   const args = parseArgs(call)
   const command = String(args.command || '')
@@ -560,6 +610,9 @@ async function execBrowser(call: ToolCall, deps: ToolDeps): Promise<Record<strin
     case 'browser_snapshot': return b.snapshot()
     case 'browser_click': return b.click(Number(args.ref))
     case 'browser_type': return b.type(Number(args.ref), String(args.text || ''), !!args.submit)
+    case 'browser_press_key': return b.pressKey(String(args.key || ''), args.ref !== undefined ? Number(args.ref) : undefined)
+    case 'browser_fill': return b.fill(Number(args.ref), String(args.value ?? ''))
+    case 'browser_select_option': return b.selectOption(Number(args.ref), String(args.value ?? ''))
     case 'browser_scroll': return b.scroll(String(args.direction) === 'up' ? 'up' : 'down', Number(args.amount) || 500)
     case 'browser_screenshot': return b.screenshot(!!args.full_page)
     case 'browser_tabs': {
@@ -596,7 +649,7 @@ function blockedByPolicy(name: string | undefined, call: ToolCall): string {
   if (FILE_READ_NAMES.has(name) && !s.toolRead) {
     return '文件读取类工具已在「设置 → 工具开关」中关闭，AI 无法读取项目文件'
   }
-  if ((name === 'write_file' || name === 'edit_file') && !s.toolWrite) {
+  if ((name === 'write_file' || name === 'edit_file' || name === 'delete_file') && !s.toolWrite) {
     return '文件写入类工具已在「设置 → 工具开关」中关闭，AI 无法修改任何文件'
   }
   if (name === 'run_command' && !s.toolShell) {
@@ -638,10 +691,12 @@ export async function executeToolCall(call: ToolCall, hooks: ExecHooks, deps: To
     switch (name) {
       case 'write_file': return execWriteFile(call, hooks)
       case 'edit_file': return execEditFile(call, hooks)
+      case 'delete_file': return execDeleteFile(call, hooks)
       case 'run_command': return execRunCommand(call, hooks)
       case 'await_shell': return execAwaitShell(call, hooks, deps)
     }
   }
+  if (name === 'ask_user') return execAskUser(call, hooks)
   if (PLAN_TOOLS.has(name)) return execTodoWrite(call, deps)
   if (BROWSER_TOOLS.has(name)) return execBrowser(call, deps)
   return { ok: false, error: `未知工具: ${name}` }

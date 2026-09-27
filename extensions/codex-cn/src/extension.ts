@@ -94,7 +94,9 @@ function activate(context: vscode.ExtensionContext): void {
   // 审批桥：请求推给 webview，等待按钮回调；开启自动审批或会话免审批时直接放行
   // 但危险命令（rm/del/shutdown 等）始终询问，防止误操作
   const requestApproval = (req: ApprovalRequest): Promise<ApprovalDecision> => {
-    if (req.danger) {
+    if (req.toolName === 'ask_user') {
+      // 结构化提问永远等用户回答，不走自动审批
+    } else if (req.danger) {
       // 危险命令不自动放行，必须人工确认
     } else {
       const auto = vscode.workspace.getConfiguration('codex-cn').get<boolean>('autoApprove', false)

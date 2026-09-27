@@ -187,6 +187,81 @@ export class BrowserSession {
     } catch (e) { return { ok: false, error: (e as Error).message } }
   }
 
+  /** 发送键盘按键（作用于聚焦元素；可传 ref 先聚焦），覆盖回车提交/Esc 关闭/方向键等高频键 */
+  async pressKey(key: string, ref?: number): Promise<{ ok: boolean; key: string; error?: string }> {
+    const KEY_MAP: Record<string, { code: string; vk: number }> = {
+      'Enter': { code: 'Enter', vk: 13 }, 'Tab': { code: 'Tab', vk: 9 }, 'Escape': { code: 'Escape', vk: 27 },
+      'Backspace': { code: 'Backspace', vk: 8 }, 'Delete': { code: 'Delete', vk: 46 },
+      'ArrowUp': { code: 'ArrowUp', vk: 38 }, 'ArrowDown': { code: 'ArrowDown', vk: 40 },
+      'ArrowLeft': { code: 'ArrowLeft', vk: 37 }, 'ArrowRight': { code: 'ArrowRight', vk: 39 },
+      'Home': { code: 'Home', vk: 36 }, 'End': { code: 'End', vk: 35 },
+      'PageUp': { code: 'PageUp', vk: 33 }, 'PageDown': { code: 'PageDown', vk: 34 },
+    }
+    const norm = KEY_MAP[key] ? key : (KEY_MAP[key.toLowerCase()] ? key.toLowerCase() : '')
+    if (!norm) return { ok: false, key, error: `不支持的按键: ${key}（可用：Enter/Tab/Escape/Backspace/Delete/Arrow*/Home/End/PageUp/PageDown）` }
+    const m = KEY_MAP[norm]
+    try {
+      await this.attachPage()
+      if (ref !== undefined) {
+        const el = this.lastEls.find((x) => x.ref === ref)
+        if (!el) return { ok: false, key, error: `ref ${ref} 已失效，请重新 browser_snapshot` }
+        await this.cdp('Runtime.evaluate', { expression: `document.elementFromPoint(${el.cx},${el.cy})?.focus()` })
+      }
+      await this.cdp('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: norm, code: m.code, windowsVirtualKeyCode: m.vk })
+      await this.cdp('Input.dispatchKeyEvent', { type: 'keyUp', key: norm, code: m.code, windowsVirtualKeyCode: m.vk })
+      await sleep(300)
+      return { ok: true, key: norm }
+    } catch (e) { return { ok: false, key, error: (e as Error).message } }
+  }
+
+  /** 输入框/文本域整体填值：原生 value setter + input/change 事件（React/Vue 受控组件兼容），比逐字 type 快且稳 */
+  async fill(ref: number, value: string): Promise<{ ok: boolean; error?: string }> {
+    const el = this.lastEls.find((x) => x.ref === ref)
+    if (!el) return { ok: false, error: `ref ${ref} 已失效，请重新 browser_snapshot` }
+    if (el.tag === 'select') return { ok: false, error: '该元素是下拉框，请用 browser_select_option' }
+    try {
+      const expr = `(function(){
+        var e=document.elementFromPoint(${el.cx},${el.cy})
+        if(!e||!("value" in e)) return "NO_INPUT"
+        var d=Object.getOwnPropertyDescriptor(e.__proto__,"value")
+        if(d&&d.set) d.set.call(e,${JSON.stringify(value)})
+        else e.value=${JSON.stringify(value)}
+        e.dispatchEvent(new Event("input",{bubbles:true}))
+        e.dispatchEvent(new Event("change",{bubbles:true}))
+        return "OK"
+      })()`
+      const r = await this.cdp('Runtime.evaluate', { expression: expr, returnByValue: true })
+      if (r.result?.value === 'NO_INPUT') return { ok: false, error: `ref ${ref} 不是可填值的输入元素` }
+      return { ok: true }
+    } catch (e) { return { ok: false, error: (e as Error).message } }
+  }
+
+  /** 选择下拉框选项：按 option 的 value 或显示文本匹配，选中后派发 input+change */
+  async selectOption(ref: number, value: string): Promise<{ ok: boolean; value?: string; selected?: string; error?: string }> {
+    const el = this.lastEls.find((x) => x.ref === ref)
+    if (!el) return { ok: false, error: `ref ${ref} 已失效，请重新 browser_snapshot` }
+    try {
+      const expr = `(function(){
+        var e=document.elementFromPoint(${el.cx},${el.cy})
+        if(!e||e.tagName!=="SELECT") return JSON.stringify({err:"NOT_SELECT"})
+        var opts=Array.prototype.slice.call(e.options)
+        var hit=opts.find(function(o){return o.value===${JSON.stringify(value)}})
+          ||opts.find(function(o){return (o.textContent||"").trim()===${JSON.stringify(value)}})
+          ||opts.find(function(o){return (o.textContent||"").trim().indexOf(${JSON.stringify(value)})>=0})
+        if(!hit) return JSON.stringify({err:"NO_MATCH",options:opts.slice(0,10).map(function(o){return {value:o.value,text:(o.textContent||"").trim().slice(0,40)}})})
+        e.value=hit.value
+        e.dispatchEvent(new Event("input",{bubbles:true}))
+        e.dispatchEvent(new Event("change",{bubbles:true}))
+        return JSON.stringify({ok:true,selected:(hit.textContent||"").trim().slice(0,60)})
+      })()`
+      const r = await this.cdp('Runtime.evaluate', { expression: expr, returnByValue: true })
+      const out = JSON.parse(r.result?.value || '{}')
+      if (out.err === 'NOT_SELECT') return { ok: false, error: `ref ${ref} 不是下拉框（select）元素` }
+      if (out.err === 'NO_MATCH') return { ok: false, error: `没有匹配「${value}」的选项。现有选项: ${JSON.stringify(out.options || [])}` }
+      return { ok: true, value, selected: out.selected }
+    } catch (e) { return { ok: false, error: (e as Error).message } }
+  }
+
   async scroll(direction: 'up' | 'down', amount = 500): Promise<{ ok: boolean }> {
     const dy = direction === 'down' ? Math.abs(amount) : -Math.abs(amount)
     await this.cdp('Runtime.evaluate', { expression: `window.scrollBy(0,${dy})` })

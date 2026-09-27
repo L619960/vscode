@@ -79,6 +79,21 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'delete_file',
+      description: '删除工作区内的文件或目录（需用户批准）。用于清理临时产物、移除废弃文件。删除前会保存快照供回滚。根目录与未打开工作区时禁止使用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '相对路径（文件或目录）' },
+          recursive: { type: 'boolean', description: '删除目录时是否递归，默认 false；目录非空且 recursive=false 会报错' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'run_command',
       description: '在工作区执行 Windows cmd 命令（需用户批准）。30 秒超时，输出截断。用于安装依赖、跑测试、构建等。禁止交互式命令。',
       parameters: {
@@ -212,6 +227,26 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'ask_user',
+      description: '向用户发起结构化提问并暂停等待回答（不计入审批开关）。当任务存在必须由用户决定、且无法从代码或上下文推断的分叉（方案取舍、需求歧义、二选一）时调用；有合理默认值时不要滥用。用户停止任务时返回停止标记。',
+      parameters: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: '问题本身，应包含必要的背景信息' },
+          options: {
+            type: 'array',
+            description: '可选的候选答案（用户仍可自由输入）。每个选项一句话说明取舍',
+            maxItems: 4,
+            items: { type: 'string' },
+          },
+        },
+        required: ['question'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'browser_navigate',
       description: '在内置浏览器中打开 URL（页面在后台加载），加载完成后可用 browser_snapshot 查看。',
       parameters: {
@@ -257,6 +292,51 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
           submit: { type: 'boolean', description: '填完后按回车，默认 false' },
         },
         required: ['ref', 'text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_press_key',
+      description: '向当前聚焦元素发送键盘按键（如回车提交、Esc 关闭弹窗、Tab 切焦点）。可传 ref 先聚焦该元素再按键。',
+      parameters: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: '键名：Enter、Tab、Escape、Backspace、Delete、ArrowUp/Down/Left/Right、Home、End、PageUp、PageDown' },
+          ref: { type: 'integer', description: '可选：先聚焦该元素（来自 browser_snapshot）' },
+        },
+        required: ['key'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_fill',
+      description: '把输入框/文本域一次性整体填值（先清空再写入，兼容 React/Vue 受控组件），比 browser_type 快且稳定。ref 来自 browser_snapshot。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref: { type: 'integer', description: '输入框元素编号' },
+          value: { type: 'string', description: '要填入的完整值' },
+        },
+        required: ['ref', 'value'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_select_option',
+      description: '选择下拉框（select 元素）的选项，按 option 的 value 或显示文本匹配。ref 来自 browser_snapshot。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref: { type: 'integer', description: 'select 元素编号' },
+          value: { type: 'string', description: 'option 的 value 或显示文本' },
+        },
+        required: ['ref', 'value'],
       },
     },
   },
@@ -320,9 +400,9 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
 ]
 
 export const READ_TOOLS = new Set(['list_dir', 'read_file', 'search_files', 'web_search', 'glob', 'web_fetch', 'read_lints'])
-export const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'run_command', 'await_shell'])
+export const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'run_command', 'await_shell'])
 /** 浏览器工具（无需审批，在沙箱隐藏窗口内执行） */
-export const BROWSER_TOOLS = new Set(['browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_scroll', 'browser_screenshot', 'browser_tabs', 'browser_eval'])
+export const BROWSER_TOOLS = new Set(['browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_press_key', 'browser_fill', 'browser_select_option', 'browser_scroll', 'browser_screenshot', 'browser_tabs', 'browser_eval'])
 /** 规划类（AI 主动登记，无副作用） */
 export const PLAN_TOOLS = new Set(['todo_write'])
 
@@ -335,6 +415,8 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
     case 'write_file':
     case 'edit_file':
       return String(args.path || '')
+    case 'delete_file': return String(args.path || '')
+    case 'ask_user': return String(args.question || '')
     case 'run_command':
       return String(args.command || '')
     case 'search_files':
@@ -351,6 +433,9 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
     case 'browser_snapshot': return ''
     case 'browser_click': return `#${args.ref}`
     case 'browser_type': return `#${args.ref} 「${String(args.text || '').slice(0, 20)}」`
+    case 'browser_press_key': return String(args.key || '')
+    case 'browser_fill': return `#${args.ref} 「${String(args.value || '').slice(0, 20)}」`
+    case 'browser_select_option': return `#${args.ref} → ${String(args.value || '').slice(0, 30)}`
     case 'browser_scroll': return String(args.direction || '')
     case 'browser_screenshot': return args.full_page ? '整页' : '可视区'
     case 'browser_tabs': return String(args.action || '')
@@ -372,6 +457,8 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
       return `已写入 ${result.bytes ?? 0} 字节`
     case 'edit_file':
       return `应用了 ${result.edits_applied ?? 0} 处修改`
+    case 'delete_file': return `已删除 ${result.path}`
+    case 'ask_user': return `用户回答：${String(result.answer || '').slice(0, 80)}`
     case 'run_command':
       return `退出码 ${result.code ?? 0}`
     case 'search_files':
@@ -391,6 +478,9 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
     case 'browser_snapshot': return `${(result.elements as unknown[])?.length ?? 0} 个可交互元素`
     case 'browser_click': return '已点击'
     case 'browser_type': return '已填入'
+    case 'browser_press_key': return `已按键 ${result.key}`
+    case 'browser_fill': return '已整体填值'
+    case 'browser_select_option': return `已选中 ${result.selected ?? result.value}`
     case 'browser_scroll': return '已滚动'
     case 'browser_screenshot': return `截图 ${result.path}`
     case 'browser_tabs': return `${(result.tabs as unknown[])?.length ?? 0} 个标签`

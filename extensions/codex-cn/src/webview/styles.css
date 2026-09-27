@@ -92,6 +92,12 @@ body {
 .reject-row { display: flex; gap: 6px; margin-top: 8px; }
 .reject-row input { flex: 1; }
 
+/* ask_user 提问卡片 */
+.ask-card { margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: rgba(14, 99, 156, 0.12); border: 1px solid var(--vscode-panel-border, #444); }
+.ask-q { font-size: 12px; line-height: 1.5; margin-bottom: 4px; }
+.ask-options { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 2px; }
+.ask-opt { max-width: 100%; text-align: left; }
+
 /* 辅助操作行（清空/回滚，位于 composer 上方） */
 .composer-extra {
   display: flex; align-items: center; gap: 10px;

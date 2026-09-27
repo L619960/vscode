@@ -30,6 +30,9 @@ interface Approval {
   path?: string
   oldContent?: string
   newContent?: string
+  /** kind=ask：ask_user 结构化提问卡片（选项按钮 + 自由输入） */
+  kind?: 'tool' | 'ask'
+  options?: string[]
 }
 
 // ---- Cursor 风格时间线：按用户消息把会话切成回合 ----
@@ -89,11 +92,12 @@ const planStats = computed(() => ({
 
 const TOOL_LABELS: Record<string, string> = {
   list_dir: '列出目录', read_file: '读取文件', write_file: '写入文件',
-  edit_file: '编辑文件', run_command: '运行命令', search_files: '搜索文件',
+  edit_file: '编辑文件', delete_file: '删除文件', run_command: '运行命令', search_files: '搜索文件',
   web_search: '联网搜索', glob: '匹配文件名', web_fetch: '抓取网页',
-  read_lints: '读取诊断', await_shell: '后台进程', todo_write: '更新规划',
+  read_lints: '读取诊断', await_shell: '后台进程', todo_write: '更新规划', ask_user: '向用户提问',
   browser_navigate: '浏览器打开', browser_snapshot: '页面快照', browser_click: '浏览器点击',
-  browser_type: '浏览器输入', browser_scroll: '浏览器滚动', browser_screenshot: '页面截图',
+  browser_type: '浏览器输入', browser_press_key: '按键操作', browser_fill: '整体填值', browser_select_option: '下拉选择',
+  browser_scroll: '浏览器滚动', browser_screenshot: '页面截图',
   browser_tabs: '标签管理', browser_eval: '执行脚本',
 }
 
@@ -548,6 +552,16 @@ function decide(a: Approval, decision: string, extra?: { viewDiff?: boolean }): 
 }
 
 const hasDiff = (a: Approval): boolean => a.oldContent !== undefined && a.newContent !== undefined
+
+/** ask_user 提问卡片：选项点击或自由输入后把回答作为 reason 回传（decision=allow） */
+const askInput = ref<Record<string, string>>({})
+function decideAsk(a: Approval, answer: string): void {
+  const text = String(answer || '').trim()
+  if (!text) return
+  const plain = JSON.parse(JSON.stringify(a)) as Approval
+  vscodeApi.postMessage({ type: 'decision', id: plain.id, decision: 'allow', reason: text, req: plain })
+  askInput.value[plain.id] = ''
+}
 const statusText = computed(() => (running.value ? '停止' : '发送'))
 
 // 自动滚动到底部
@@ -803,8 +817,21 @@ watch(running, (now, prev) => {
                       <span class="gd-badge" :class="node.run.status">{{ node.run.status === 'awaiting' ? '待批准' : '执行中' }}</span>
                     </div>
                     <div v-if="node.run.resultSummary" class="gd-result">{{ node.run.resultSummary }}</div>
+                    <!-- ask_user 提问卡片：问题 + 选项按钮 + 自由输入 -->
+                    <template v-if="node.run.status === 'awaiting' && approvalFor(node.run)?.kind === 'ask'">
+                      <div class="ask-card">
+                        <div class="ask-q">{{ approvalFor(node.run)!.argsSummary }}</div>
+                        <div v-if="approvalFor(node.run)!.options?.length" class="ask-options">
+                          <button v-for="opt in approvalFor(node.run)!.options" :key="opt" class="mini ask-opt" @click="decideAsk(approvalFor(node.run)!, opt)">{{ opt }}</button>
+                        </div>
+                        <div class="reject-row">
+                          <input v-model="askInput[approvalFor(node.run)!.id]" placeholder="或输入你的回答…" @keydown.enter="decideAsk(approvalFor(node.run)!, askInput[approvalFor(node.run)!.id] || '')" />
+                          <button class="mini primary" @click="decideAsk(approvalFor(node.run)!, askInput[approvalFor(node.run)!.id] || '')">回答</button>
+                        </div>
+                      </div>
+                    </template>
                     <!-- 审批按钮 -->
-                    <template v-if="node.run.status === 'awaiting' && approvalFor(node.run)">
+                    <template v-else-if="node.run.status === 'awaiting' && approvalFor(node.run)">
                       <div class="tc-actions" v-if="!rejectMode[approvalFor(node.run)!.id]">
                         <button class="mini primary" @click="decide(approvalFor(node.run)!, 'allow')">允许</button>
                         <button class="mini" @click="decide(approvalFor(node.run)!, 'deny')">拒绝</button>
