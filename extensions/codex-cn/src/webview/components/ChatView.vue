@@ -535,10 +535,13 @@ const rejectMode = ref<Record<string, boolean>>({})
 const rejectReason = ref('')
 function decide(a: Approval, decision: string, extra?: { viewDiff?: boolean }): void {
   if (decision === 'deny' && !rejectMode.value[a.id]) { rejectMode.value[a.id] = true; return }
+  // postMessage 走结构化克隆，Vue 响应式 Proxy 无法克隆（DataCloneError 会被静默吞掉），
+  // 必须转成纯对象再发送，否则审批决定永远到不了扩展侧
+  const plain = JSON.parse(JSON.stringify(a)) as Approval
   vscodeApi.postMessage({
-    type: 'decision', id: a.id, decision,
+    type: 'decision', id: plain.id, decision,
     reason: rejectReason.value.trim() || undefined,
-    viewDiff: extra?.viewDiff, req: a,
+    viewDiff: extra?.viewDiff, req: plain,
   })
   rejectMode.value[a.id] = false
   rejectReason.value = ''

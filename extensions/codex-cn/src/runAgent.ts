@@ -262,21 +262,35 @@ function truncateToolResult(name: string, result: Record<string, unknown>): Reco
 /** 单个工具执行超时（毫秒） */
 const TOOL_TIMEOUT_MS = 30000
 
-/** 带超时执行工具：超时返回错误结果而不是挂死主循环 */
+/** 带超时执行工具：超时返回错误结果而不是挂死主循环。
+ *  等待人工审批期间暂停计时（审批可无限期等待，人工决定优先于机器超时）。 */
 async function executeToolWithTimeout(call: ToolCall, hooks: ExecHooks, deps: ToolDeps): Promise<Record<string, unknown>> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  // await_shell 等待后台进程（内部上限 60s）；浏览器首启 Edge 较慢
   const n = call.function?.name || ''
   const limit = n === 'await_shell' ? 70000 : n.startsWith('browser_') ? 50000 : TOOL_TIMEOUT_MS
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let remaining = limit
+  let stageStart = Date.now()
+  let raceResolve: (v: Record<string, unknown>) => void = () => {}
+  const timeoutP = new Promise<Record<string, unknown>>((resolve) => {
+    raceResolve = resolve
+    timer = setTimeout(() => raceResolve({ ok: false, error: `工具执行超过 ${limit / 1000} 秒已超时。请缩小操作范围或换一种方式重试` }), limit)
+  })
+  const armedHooks: ExecHooks = {
+    ...hooks,
+    requestApproval: async (req) => {
+      // 进入人工审批：暂停超时计时
+      if (timer) { clearTimeout(timer); timer = undefined; remaining -= Date.now() - stageStart }
+      try {
+        return await hooks.requestApproval(req)
+      } finally {
+        // 审批结束：恢复剩余计时（至少保留 5 秒给命令本身）
+        stageStart = Date.now()
+        timer = setTimeout(() => raceResolve({ ok: false, error: `工具执行超过 ${limit / 1000} 秒已超时。请缩小操作范围或换一种方式重试` }), Math.max(remaining, 5000))
+      }
+    },
+  }
   try {
-    return await Promise.race([
-      executeToolCall(call, hooks, deps),
-      new Promise<Record<string, unknown>>((resolve) => {
-        timer = setTimeout(() => {
-          resolve({ ok: false, error: `工具执行超过 ${limit / 1000} 秒已超时。请缩小操作范围或换一种方式重试` })
-        }, limit)
-      }),
-    ])
+    return await Promise.race([executeToolCall(call, armedHooks, deps), timeoutP])
   } finally {
     if (timer) clearTimeout(timer)
   }

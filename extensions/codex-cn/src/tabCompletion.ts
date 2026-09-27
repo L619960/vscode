@@ -51,6 +51,9 @@ export class TabCompletionProvider implements vscode.InlineCompletionItemProvide
     const config = getLLMConfig(apiKey)
     if (!config.baseUrl || !config.model) return []
 
+    // Qwen3 系列默认思考模式会把小 max_tokens 全部耗在 <think> 里导致正文为空，需显式关闭
+    const providerName = vscode.workspace.getConfiguration('codex-cn').get<string>('provider', 'doubao')
+
     try {
       const response = await fetch(`${config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
         method: 'POST',
@@ -73,6 +76,7 @@ export class TabCompletionProvider implements vscode.InlineCompletionItemProvide
           max_tokens: MAX_TOKENS,
           temperature: 0.2,
           stream: false,
+          ...(providerName === 'llama' ? { chat_template_kwargs: { enable_thinking: false } } : {}),
         }),
         signal: this.abortController.signal,
       })
@@ -92,7 +96,7 @@ export class TabCompletionProvider implements vscode.InlineCompletionItemProvide
       if (!clean) return []
 
       return [new vscode.InlineCompletionItem(clean, new vscode.Range(position, position))]
-    } catch {
+    } catch (e) {
       // 网络错误 / 中止：静默返回空
       return []
     }
