@@ -9,8 +9,12 @@
     "vscode": "^1.140.0"
   },
   "main": "./out/extension",
-  "extensionKind": ["ui"],
-  "activationEvents": ["onStartupFinished"],
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
@@ -67,8 +71,28 @@
         "codex-cn.provider": {
           "type": "string",
           "default": "doubao",
-          "enum": ["doubao", "deepseek", "qwen", "kimi", "zhipu", "openai", "llama", "ollama", "custom"],
-          "enumDescriptions": ["豆包", "DeepSeek", "通义千问", "Kimi", "智谱", "OpenAI", "llama.cpp", "Ollama", "自定义"],
+          "enum": [
+            "doubao",
+            "deepseek",
+            "qwen",
+            "kimi",
+            "zhipu",
+            "openai",
+            "llama",
+            "ollama",
+            "custom"
+          ],
+          "enumDescriptions": [
+            "豆包",
+            "DeepSeek",
+            "通义千问",
+            "Kimi",
+            "智谱",
+            "OpenAI",
+            "llama.cpp",
+            "Ollama",
+            "自定义"
+          ],
           "description": "模型提供商"
         },
         "codex-cn.baseUrl": {
@@ -84,8 +108,16 @@
         "codex-cn.supportsTools": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "yes", "no"],
-          "enumDescriptions": ["自动检测（400 自动降级）", "强制启用工具调用", "关闭（纯对话）"],
+          "enum": [
+            "auto",
+            "yes",
+            "no"
+          ],
+          "enumDescriptions": [
+            "自动检测（400 自动降级）",
+            "强制启用工具调用",
+            "关闭（纯对话）"
+          ],
           "description": "工具调用支持"
         },
         "codex-cn.autoApprove": {
@@ -108,6 +140,7 @@
     "build-webview": "node ./esbuild.webview.mts"
   },
   "dependencies": {
+    "vant": "^4.10.2",
     "vue": "^3.5.13"
   },
   "devDependencies": {

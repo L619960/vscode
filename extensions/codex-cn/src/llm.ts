@@ -22,6 +22,18 @@ async function post(url: string, apiKey: string, body: string, signal: AbortSign
 }
 
 /**
+ * 判断服务端错误是否为「工具调用参数过长被截断」：
+ * llama.cpp 在生成长 JSON 中途撞 token 上限时，解析器报 missing closing quote /
+ * unexpected end / invalid string，且错误位置（column）通常已在数千字符之后
+ */
+function isTruncationError(text: string): boolean {
+  if (!/parse tool call|parse_error|tool call arguments/i.test(text)) return false
+  if (/missing closing quote|unexpected end|unterminated|invalid string|end of input/i.test(text)) return true
+  const col = /column\s+(\d+)/i.exec(text)
+  return !!col && Number(col[1]) > 2000
+}
+
+/**
  * 流式对话补全
  * @param opts.messages OpenAI 消息数组
  * @param opts.tools 工具 schema
@@ -72,7 +84,7 @@ export async function chatCompletion(opts: {
 
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '')
-    // llama.cpp 服务端 500 重试一次（本地模型生成长 JSON 时偶发格式错误）
+    // llama.cpp 服务端 500 重试一次（采样有随机性；本地模型生成长 JSON 时偶发格式错误）
     if (resp.status === 500 && errText.includes('parse tool call')) {
       await new Promise(r => setTimeout(r, 800))
       try {
@@ -81,14 +93,23 @@ export async function chatCompletion(opts: {
           resp = retryResp
         } else {
           const retryText = await retryResp.text().catch(() => '')
-          return { content: '', toolCalls: [], finishReason: null, degraded: false, error: `API 错误 ${retryResp.status}: ${retryText.slice(0, 300)}` }
+          const truncated = isTruncationError(errText) || isTruncationError(retryText)
+          return {
+            content: '', toolCalls: [], finishReason: null, degraded: false,
+            error: `API 错误 ${retryResp.status}: ${retryText.slice(0, 300)}`,
+            truncated,
+          }
         }
       } catch (e) {
         if ((e as Error).name === 'AbortError') return { content: '', toolCalls: [], finishReason: null, degraded: false, aborted: true }
         return { content: '', toolCalls: [], finishReason: null, degraded: false, error: `网络错误: ${(e as Error).message}` }
       }
     } else {
-      return { content: '', toolCalls: [], finishReason: null, degraded: false, error: `API 错误 ${resp.status}: ${errText.slice(0, 300)}` }
+      return {
+        content: '', toolCalls: [], finishReason: null, degraded: false,
+        error: `API 错误 ${resp.status}: ${errText.slice(0, 300)}`,
+        truncated: resp.status === 500 && isTruncationError(errText),
+      }
     }
   }
   const degraded = !withTools && !!tools?.length

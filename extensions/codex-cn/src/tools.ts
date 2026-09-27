@@ -121,10 +121,210 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'glob',
+      description: '按 glob 模式快速查找文件名（如 "src/**/*.test.ts"、"**/*.md"）。支持 *、**、?。返回匹配的相对路径。',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'glob 模式' },
+          path: { type: 'string', description: '限定搜索的子目录，默认整个工作区' },
+        },
+        required: ['pattern'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'web_fetch',
+      description: '抓取指定 URL 的页面正文（自动转为纯文本），用于阅读官方文档、长文。单次最多返回约 6000 字符。',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: '完整 http(s) URL' },
+        },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_lints',
+      description: '读取 VS Code 语言服务对文件的诊断（错误/警告，含行号与信息），相当于编辑器"问题"面板。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '相对文件或目录路径；省略则返回整个工作区的诊断' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'await_shell',
+      description: '管理后台长驻进程（如 dev server）：start 启动并立即返回 id；logs 查看输出；wait 等待结束；stop 停止；list 列出。',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['start', 'logs', 'wait', 'stop', 'list'], description: '操作类型' },
+          command: { type: 'string', description: 'action=start 时要后台运行的命令（需批准）' },
+          cwd: { type: 'string', description: 'action=start 时的工作子目录' },
+          id: { type: 'string', description: 'logs/wait/stop 时的进程 id' },
+          timeout: { type: 'integer', description: 'wait 最长等待毫秒，默认 30000' },
+        },
+        required: ['action'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'todo_write',
+      description: '设置（全量替换）本次任务的规划清单，用于主动登记调研/设计/开发/验证等检查点。每次传入完整列表。',
+      parameters: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            description: '完整任务检查点列表',
+            items: {
+              type: 'object',
+              properties: {
+                label: { type: 'string', description: '检查点名称' },
+                priority: { type: 'string', enum: ['P0', 'P1'], description: 'P0 阻断交付 / P1 次要' },
+                status: { type: 'string', enum: ['done', 'running', 'error'], description: '完成/进行中/失败' },
+                evidence: { type: 'string', description: '验证证据：日志/退出码/产物路径' },
+                remark: { type: 'string', description: '边界说明、限制' },
+              },
+              required: ['label', 'priority', 'status'],
+            },
+          },
+        },
+        required: ['items'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_navigate',
+      description: '在内置浏览器中打开 URL（页面在后台加载），加载完成后可用 browser_snapshot 查看。',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string' },
+          new_tab: { type: 'boolean', description: '是否在新标签打开，默认 false' },
+        },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_snapshot',
+      description: '获取当前页面快照：URL、标题、可交互元素（链接/按钮/输入框，带 ref 编号）、正文文本摘要。click/type 时使用返回的 ref。',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_click',
+      description: '点击页面元素（ref 来自最近一次 browser_snapshot）。',
+      parameters: {
+        type: 'object',
+        properties: { ref: { type: 'integer', description: '元素编号' } },
+        required: ['ref'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_type',
+      description: '向输入框元素填入文本（先清空），ref 来自 browser_snapshot。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref: { type: 'integer' },
+          text: { type: 'string' },
+          submit: { type: 'boolean', description: '填完后按回车，默认 false' },
+        },
+        required: ['ref', 'text'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_scroll',
+      description: '滚动当前页面。',
+      parameters: {
+        type: 'object',
+        properties: {
+          direction: { type: 'string', enum: ['up', 'down'], description: '滚动方向' },
+          amount: { type: 'integer', description: '像素数，默认 500' },
+        },
+        required: ['direction'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_screenshot',
+      description: '对当前页面截图，保存为 PNG 到工作区 .browser-shots/ 目录，返回文件路径。',
+      parameters: {
+        type: 'object',
+        properties: {
+          full_page: { type: 'boolean', description: '是否整页截图，默认 false（仅可视区）' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_tabs',
+      description: '管理浏览器标签：list 列出 / activate 切换 / close 关闭。',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'activate', 'close'] },
+          index: { type: 'integer', description: 'activate/close 的标签序号（来自 list）' },
+        },
+        required: ['action'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_eval',
+      description: '在当前页面执行 JavaScript 表达式并返回结果（沙箱页面内，无本机权限）。用于读取页面状态。',
+      parameters: {
+        type: 'object',
+        properties: {
+          script: { type: 'string', description: 'JavaScript 表达式，如 document.title' },
+        },
+        required: ['script'],
+      },
+    },
+  },
 ]
 
-export const READ_TOOLS = new Set(['list_dir', 'read_file', 'search_files', 'web_search'])
-export const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'run_command'])
+export const READ_TOOLS = new Set(['list_dir', 'read_file', 'search_files', 'web_search', 'glob', 'web_fetch', 'read_lints'])
+export const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'run_command', 'await_shell'])
+/** 浏览器工具（无需审批，在沙箱隐藏窗口内执行） */
+export const BROWSER_TOOLS = new Set(['browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_scroll', 'browser_screenshot', 'browser_tabs', 'browser_eval'])
+/** 规划类（AI 主动登记，无副作用） */
+export const PLAN_TOOLS = new Set(['todo_write'])
 
 export function summarizeArgs(name: string, args: Record<string, unknown>): string {
   if (!args || typeof args !== 'object') return ''
@@ -141,6 +341,20 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
       return `"${args.query || ''}"${args.path ? ` in ${args.path}` : ''}`
     case 'web_search':
       return String(args.query || '')
+    case 'glob': return String(args.pattern || '')
+    case 'web_fetch': return String(args.url || '')
+    case 'read_lints': return String(args.path || '.')
+    case 'await_shell':
+      return args.action === 'start' ? String(args.command || '') : `${args.action} ${args.id || ''}`
+    case 'todo_write': return `${(args.items as unknown[] || []).length} 项检查点`
+    case 'browser_navigate': return String(args.url || '')
+    case 'browser_snapshot': return ''
+    case 'browser_click': return `#${args.ref}`
+    case 'browser_type': return `#${args.ref} 「${String(args.text || '').slice(0, 20)}」`
+    case 'browser_scroll': return String(args.direction || '')
+    case 'browser_screenshot': return args.full_page ? '整页' : '可视区'
+    case 'browser_tabs': return String(args.action || '')
+    case 'browser_eval': return String(args.script || '').slice(0, 60)
     default:
       return JSON.stringify(args).slice(0, 80)
   }
@@ -164,6 +378,23 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
       return `${(result.matches as unknown[])?.length ?? 0} 处匹配${result.truncated ? '（已截断）' : ''}`
     case 'web_search':
       return `${result.count ?? 0} 条结果`
+    case 'glob': return `${(result.paths as unknown[])?.length ?? 0} 个文件`
+    case 'web_fetch': return result.truncated ? `${(result.content as string).length} 字符（已截断）` : `${(result.content as string).length} 字符`
+    case 'read_lints': return `${(result.diagnostics as unknown[])?.length ?? 0} 条诊断`
+    case 'await_shell':
+      if (result.action === 'start') return `已启动 ${result.id}（${result.running ? '运行中' : '已退出'}）`
+      if (result.action === 'wait') return `进程已${result.exited ? '结束' : '超时仍在运行'}`
+      if (result.action === 'stop') return '已停止'
+      return '完成'
+    case 'todo_write': return `已登记 ${result.total ?? 0} 项（P0 ${result.p0 ?? 0}，完成 ${result.done ?? 0}）`
+    case 'browser_navigate': return `已打开 ${result.title || result.url}`
+    case 'browser_snapshot': return `${(result.elements as unknown[])?.length ?? 0} 个可交互元素`
+    case 'browser_click': return '已点击'
+    case 'browser_type': return '已填入'
+    case 'browser_scroll': return '已滚动'
+    case 'browser_screenshot': return `截图 ${result.path}`
+    case 'browser_tabs': return `${(result.tabs as unknown[])?.length ?? 0} 个标签`
+    case 'browser_eval': return '已执行'
     default:
       return '完成'
   }

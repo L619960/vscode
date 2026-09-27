@@ -29,4 +29,6 @@ export interface ChatResult {
   degraded: boolean
   error?: string
   aborted?: boolean
+  /** 错误由工具调用参数过长被截断导致（JSON 不完整），需强制分批写入回喂 */
+  truncated?: boolean
 }

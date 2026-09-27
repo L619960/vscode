@@ -3,16 +3,89 @@
 
 import { exec as cpExec } from 'node:child_process'
 import { promisify } from 'node:util'
+import { existsSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 import * as vscode from 'vscode'
-import { READ_TOOLS, WRITE_TOOLS, summarizeArgs } from './tools.js'
+import { READ_TOOLS, WRITE_TOOLS, BROWSER_TOOLS, PLAN_TOOLS, summarizeArgs } from './tools.js'
 import { saveCheckpoint } from './checkpoints.js'
 import { webSearch } from './webSearch.js'
+import type { TaskBoard, TaskCheckpoint } from './taskBoard.js'
+import type { BackgroundShell } from './backgroundShell.js'
+import type { BrowserSession } from './browser.js'
 import type { ToolCall } from './types.js'
 
 const execPromise = promisify(cpExec)
 const DANGER_RE = /\b(rm\s+-rf|del\s+\/s|format|shutdown|rd\s+\/s|erase\s+\/s)\b/i
 const BINARY_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.ico', '.exe', '.dll', '.zip', '.woff', '.woff2', '.ttf', '.pdf', '.mp3', '.mp4', '.webm'])
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'dist-electron', '.vscode', '.idea'])
+
+// ---- Python 安装发现（PATH 可能缺失/编码损坏，导致 AI 的 python 命令全部失败）----
+let cachedPython: string | null | undefined
+
+/**
+ * 优先用 py launcher（位于 System32，不受 PATH 损坏影响）查出真实 python.exe
+ * 用 stdout.buffer 写死 UTF-8，避免管道默认编码（GBK/UTF-8）随环境变化
+ */
+function pythonViaPyLauncher(): string | null {
+  try {
+    const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
+    const out = execFileSync('py', ['-c', 'import sys;sys.stdout.buffer.write(sys.executable.encode("utf-8"))'], {
+      windowsHide: true, encoding: 'buffer', timeout: 8000,
+      env: { ...process.env, PYTHONUTF8: '1' },
+    }) as Buffer
+    const py = new TextDecoder('utf-8').decode(out).trim()
+    return existsSync(py) ? py : null
+  } catch { return null }
+}
+
+/** 枚举所有用户目录下的 Python 安装（不依赖可能乱码的 LOCALAPPDATA） */
+function pythonInUserProfiles(): string[] {
+  const found: string[] = []
+  let users: string[] = []
+  try { users = readdirSync('C:\\Users') } catch { return found }
+  for (const u of users) {
+    const dir = join('C:\\Users', u, 'AppData', 'Local', 'Programs', 'Python')
+    try {
+      for (const d of readdirSync(dir)) {
+        if (/^Python\d+/.test(d)) found.push(join(dir, d, 'python.exe'))
+      }
+    } catch { /* 无此目录 */ }
+  }
+  return found.filter(existsSync)
+}
+
+/** 发现本机 python.exe，按优先级返回；结果缓存 */
+function findPythonInstall(): string | null {
+  if (cachedPython !== undefined) return cachedPython
+  const viaPy = pythonViaPyLauncher()
+  if (viaPy) { cachedPython = viaPy; return viaPy }
+  const candidates = pythonInUserProfiles()
+  // 兜底：LOCALAPPDATA 与盘根
+  const scan = (dir: string): void => {
+    try {
+      for (const d of readdirSync(dir)) {
+        if (/^Python\d+/.test(d)) candidates.push(join(dir, d, 'python.exe'))
+      }
+    } catch { /* 目录不存在 */ }
+  }
+  if (process.env.LOCALAPPDATA) scan(join(process.env.LOCALAPPDATA, 'Programs', 'Python'))
+  scan('C:\\')
+  scan('D:\\')
+  cachedPython = candidates.filter(existsSync).sort().reverse()[0] || null
+  return cachedPython
+}
+
+/**
+ * python 系命令在 PATH 缺失时，用发现的 python 重写命令：
+ * python/python3 → 绝对路径；pip/pytest → python -m 形式
+ */
+function rewriteWithPython(command: string, py: string): string | null {
+  let m: RegExpExecArray | null
+  if ((m = /^python3?(?:\.exe)?(\s[\s\S]*)$/i.exec(command))) return `"${py}"${m[1]}`
+  if ((m = /^pip3?(?:\.exe)?(\s[\s\S]*)$/i.exec(command))) return `"${py}" -m pip${m[1]}`
+  if ((m = /^pytest(?:\.exe)?(\s[\s\S]*)$/i.exec(command))) return `"${py}" -m pytest${m[1]}`
+  return null
+}
 
 export interface ApprovalRequest {
   toolName: string
@@ -32,6 +105,13 @@ export interface ApprovalDecision {
 export interface ExecHooks {
   requestApproval(req: ApprovalRequest): Promise<ApprovalDecision>
   setStatus(status: string): void
+}
+
+/** 扩展注入的有状态依赖（任务板 / 后台 Shell / 浏览器） */
+export interface ToolDeps {
+  board: TaskBoard
+  bgShell: BackgroundShell
+  browser: BrowserSession
 }
 
 // ---- 路径工具 ----
@@ -182,6 +262,83 @@ async function execWebSearch(call: ToolCall): Promise<Record<string, unknown>> {
   }
 }
 
+// ---- Glob：文件名模式匹配（findFiles）----
+async function execGlob(call: ToolCall): Promise<Record<string, unknown>> {
+  const args = parseArgs(call)
+  const pattern = String(args.pattern || '').trim()
+  if (!pattern) return { ok: false, error: 'glob 缺少 pattern 参数' }
+  try {
+    const baseRel = normalizeRel(args.path || '.')
+    const baseUri = baseRel === '' ? rootUri() : toUri(baseRel)
+    const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(baseUri, pattern), null, 300)
+    const paths = uris.map((u) => vscode.workspace.asRelativePath(u)).slice(0, 200)
+    return { ok: true, pattern, count: paths.length, paths }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message }
+  }
+}
+
+// ---- WebFetch：抓取 URL 正文 ----
+function htmlToText(html: string): string {
+  let s = html.replace(/<(script|style|noscript)[\s\S]*?<\/\1>/gi, '')
+  s = s.replace(/<\/(div|p|li|h[1-6]|tr|table|section|article)>/gi, '\n')
+  s = s.replace(/<br\s*\/?>/gi, '\n')
+  s = s.replace(/<[^>]+>/g, '')
+  s = s.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+  return s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+async function execWebFetch(call: ToolCall): Promise<Record<string, unknown>> {
+  const args = parseArgs(call)
+  const url = String(args.url || '').trim()
+  if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'web_fetch 的 url 必须是 http(s) 地址' }
+  try {
+    const resp = await fetch(url, {
+      redirect: 'follow', signal: AbortSignal.timeout(15000),
+      headers: { 'User-Agent': 'Mozilla/5.0 CodexCN' },
+    })
+    const ctype = resp.headers.get('content-type') || ''
+    if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` }
+    let content: string
+    if (/charset=([\w-]+)/i.test(ctype) && /gb|big5/i.test(RegExp.$1)) {
+      content = new TextDecoder(RegExp.$1).decode(await resp.arrayBuffer())
+    } else {
+      content = await resp.text()
+    }
+    content = ctype.includes('html') ? htmlToText(content) : content
+    const max = 6000
+    const truncated = content.length > max
+    return { ok: true, url, content: content.slice(0, max), truncated }
+  } catch (e) {
+    return { ok: false, error: `抓取失败: ${(e as Error).message}` }
+  }
+}
+
+// ---- ReadLints：语言服务诊断 ----
+const SEVERITY_LABEL = ['', 'error', 'warning', 'info', 'hint']
+
+async function execReadLints(call: ToolCall): Promise<Record<string, unknown>> {
+  const args = parseArgs(call)
+  try {
+    const target = args.path ? toUri(String(args.path)) : undefined
+    const entries: Array<[vscode.Uri, readonly vscode.Diagnostic[]]> = target
+      ? [[target, vscode.languages.getDiagnostics(target)]]
+      : vscode.languages.getDiagnostics()
+    const diagnostics = entries.flatMap(([uri, diags]) => diags.map((d) => ({
+      path: vscode.workspace.asRelativePath(uri),
+      line: d.range.start.line + 1, col: d.range.start.character + 1,
+      severity: SEVERITY_LABEL[d.severity] || 'hint',
+      message: d.message, source: d.source || '',
+    }))).slice(0, 100)
+    const errors = diagnostics.filter((d) => d.severity === 'error').length
+    const warnings = diagnostics.filter((d) => d.severity === 'warning').length
+    return { ok: true, count: diagnostics.length, errors, warnings, diagnostics }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message }
+  }
+}
+
 // ---- 写类 ----
 async function execWriteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
   const args = parseArgs(call)
@@ -200,8 +357,14 @@ async function execWriteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<s
   try {
     // 写入前保存快照，供「回滚」恢复
     await saveCheckpoint(toUri(pathRel).fsPath)
-    await vscode.workspace.fs.writeFile(toUri(pathRel), new TextEncoder().encode(String(args.content ?? '')))
-    return { ok: true, path: pathRel, bytes: new TextEncoder().encode(String(args.content ?? '')).length }
+    const newContent = String(args.content ?? '')
+    await vscode.workspace.fs.writeFile(toUri(pathRel), new TextEncoder().encode(newContent))
+    return {
+      ok: true, path: pathRel, bytes: new TextEncoder().encode(newContent).length,
+      // 行数统计：供时间线「+N -M」变更卡片展示
+      lines_added: newContent.split('\n').length,
+      lines_removed: oldContent ? oldContent.split('\n').length : 0,
+    }
   } catch (e) {
     return { ok: false, error: (e as Error).message }
   }
@@ -258,7 +421,11 @@ async function execEditFile(call: ToolCall, hooks: ExecHooks): Promise<Record<st
     // 写入前保存快照，供「回滚」恢复
     await saveCheckpoint(toUri(pathRel).fsPath)
     await vscode.workspace.fs.writeFile(toUri(pathRel), new TextEncoder().encode(editRes.text))
-    return { ok: true, path: pathRel, edits_applied: editRes.edits_applied }
+    // 行数统计：供时间线「+N -M」变更卡片展示
+    const edits = Array.isArray(args.edits) ? args.edits : []
+    const linesAdded = edits.reduce((n: number, e: any) => n + String(e.replace ?? '').split('\n').length, 0)
+    const linesRemoved = edits.reduce((n: number, e: any) => n + String(e.search ?? '').split('\n').length, 0)
+    return { ok: true, path: pathRel, edits_applied: editRes.edits_applied, lines_added: linesAdded, lines_removed: linesRemoved }
   } catch (e) {
     return { ok: false, error: (e as Error).message }
   }
@@ -279,28 +446,133 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
   const cwdRel = normalizeRel(args.cwd || '.')
   const cwdUri = cwdRel === '' ? rootUri() : toUri(cwdRel)
   const cwdPath = cwdUri.fsPath
-  try {
-    const { stdout: rawOut, stderr: rawErr } = await execPromise(`chcp 65001 >nul && ${command}`, {
-      cwd: cwdPath, timeout: 30000, maxBuffer: 2 * 1024 * 1024, windowsHide: true,
-    })
-    const max = 8192
-    const stdout = String(rawOut || '').length > max ? String(rawOut).slice(0, max) + '\n[输出已截断]' : String(rawOut || '')
-    const stderr = String(rawErr || '').length > max ? String(rawErr).slice(0, max) + '\n[输出已截断]' : String(rawErr || '')
-    return { ok: true, code: 0, stdout, stderr }
-  } catch (e: any) {
-    if (e.killed && e.signal === 'SIGTERM') return { ok: false, error: '命令执行超过 30 秒已终止' }
-    // exec 在非零退出码时 reject，stderr/stdout 在 e 上
-    if (typeof e.code === 'number') {
-      const stdout = String(e.stdout || '').slice(0, 8192)
-      const stderr = String(e.stderr || '').slice(0, 8192)
-      return { ok: false, code: e.code, stdout, stderr, error: stderr ? stderr.split('\n')[0] : '命令失败' }
+
+  /** 单次执行：chcp 65001 保证中文输出编码；强制 Python 以 UTF-8 输出 */
+  const runOnce = async (cmd: string): Promise<Record<string, any>> => {
+    try {
+      const { stdout: rawOut, stderr: rawErr } = await execPromise(`chcp 65001 >nul && ${cmd}`, {
+        cwd: cwdPath, timeout: 30000, maxBuffer: 2 * 1024 * 1024, windowsHide: true,
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+      })
+      const max = 8192
+      const stdout = String(rawOut || '').length > max ? String(rawOut).slice(0, max) + '\n[输出已截断]' : String(rawOut || '')
+      const stderr = String(rawErr || '').length > max ? String(rawErr).slice(0, max) + '\n[输出已截断]' : String(rawErr || '')
+      return { ok: true, code: 0, stdout, stderr }
+    } catch (e: any) {
+      if (e.killed && e.signal === 'SIGTERM') return { ok: false, error: '命令执行超过 30 秒已终止' }
+      // exec 在非零退出码时 reject，stderr/stdout 在 e 上
+      if (typeof e.code === 'number') {
+        const stdout = String(e.stdout || '').slice(0, 8192)
+        const stderr = String(e.stderr || '').slice(0, 8192)
+        return { ok: false, code: e.code, stdout, stderr, error: stderr ? stderr.split('\n')[0] : '命令失败' }
+      }
+      return { ok: false, error: (e as Error).message }
     }
-    return { ok: false, error: (e as Error).message }
+  }
+
+  let result = await runOnce(command)
+
+  // python 系命令失败：不靠错误文本判断（cmd 错误消息随系统语言/代码页变化，
+  // 且可能是 GBK 乱码），直接发现本机 python 并用绝对路径重试一次。
+  // 业务错误时重试结果等价，无害；命令已是绝对路径时无需重试。
+  const isBarePythonCmd = /^python3?(?:\.exe)?\s|^pip3?(?:\.exe)?\s|^pytest(?:\.exe)?\s/i.test(command + ' ')
+  if (!result.ok && isBarePythonCmd) {
+    const py = findPythonInstall()
+    if (py) {
+      const rewritten = rewriteWithPython(command, py)
+      if (rewritten && !rewritten.includes('""')) {
+        result = await runOnce(rewritten)
+        if (result.ok) result.note = `已自动使用本机 Python：${py}`
+      }
+    }
+  }
+
+  return result
+}
+
+// ---- AwaitShell：后台进程 ----
+async function execAwaitShell(call: ToolCall, hooks: ExecHooks, deps: ToolDeps): Promise<Record<string, unknown>> {
+  const args = parseArgs(call)
+  const action = String(args.action || '')
+  switch (action) {
+    case 'start': {
+      const command = String(args.command || '')
+      if (!command) return { ok: false, error: 'await_shell start 缺少 command 参数' }
+      const danger = DANGER_RE.test(command)
+      hooks.setStatus('awaiting')
+      const apr = await hooks.requestApproval({
+        toolName: 'await_shell', argsSummary: summarizeArgs('await_shell', args), command, danger,
+      })
+      if (apr.decision !== 'allow') return { ok: false, error: `用户拒绝了后台命令${apr.reason ? '：' + apr.reason : ''}` }
+      const cwdRel = normalizeRel(args.cwd || '.')
+      const cwdUri = cwdRel === '' ? rootUri() : toUri(cwdRel)
+      return { ok: true, ...deps.bgShell.start(command, cwdUri.fsPath) }
+    }
+    case 'logs': {
+      if (!args.id) return { ok: false, error: 'logs 缺少 id' }
+      return deps.bgShell.logs(String(args.id))
+    }
+    case 'wait': {
+      if (!args.id) return { ok: false, error: 'wait 缺少 id' }
+      const timeout = Math.min(Number(args.timeout) || 30000, 60000)
+      return { action: 'wait', ...await deps.bgShell.wait(String(args.id), timeout) }
+    }
+    case 'stop': {
+      if (!args.id) return { ok: false, error: 'stop 缺少 id' }
+      return deps.bgShell.stop(String(args.id))
+    }
+    case 'list':
+      return { ok: true, action: 'list', processes: deps.bgShell.list() }
+    default:
+      return { ok: false, error: `await_shell 未知 action: ${action}` }
+  }
+}
+
+// ---- TodoWrite：AI 主动任务规划 ----
+function normalizeCheckpoint(raw: unknown): TaskCheckpoint | null {
+  const x = raw as Record<string, unknown>
+  if (!x || typeof x.label !== 'string') return null
+  const priority = x.priority === 'P1' ? 'P1' : 'P0'
+  const status = x.status === 'running' || x.status === 'error' ? x.status : 'done'
+  return {
+    label: x.label.slice(0, 120), priority, status,
+    evidence: typeof x.evidence === 'string' ? x.evidence.slice(0, 300) : undefined,
+    remark: typeof x.remark === 'string' ? x.remark.slice(0, 300) : undefined,
+  }
+}
+
+function execTodoWrite(call: ToolCall, deps: ToolDeps): Record<string, unknown> {
+  const args = parseArgs(call)
+  if (!Array.isArray(args.items)) return { ok: false, error: 'todo_write 缺少 items 数组' }
+  const items = args.items.map(normalizeCheckpoint).filter((x): x is TaskCheckpoint => x !== null)
+  if (!items.length) return { ok: false, error: 'items 中没有合法检查点（每项需有 label）' }
+  return { ok: true, ...deps.board.replace(items) }
+}
+
+// ---- 浏览器工具分发 ----
+async function execBrowser(call: ToolCall, deps: ToolDeps): Promise<Record<string, unknown>> {
+  const name = call.function?.name
+  const args = parseArgs(call)
+  const b = deps.browser
+  switch (name) {
+    case 'browser_navigate': return b.navigate(String(args.url || ''), !!args.new_tab)
+    case 'browser_snapshot': return b.snapshot()
+    case 'browser_click': return b.click(Number(args.ref))
+    case 'browser_type': return b.type(Number(args.ref), String(args.text || ''), !!args.submit)
+    case 'browser_scroll': return b.scroll(String(args.direction) === 'up' ? 'up' : 'down', Number(args.amount) || 500)
+    case 'browser_screenshot': return b.screenshot(!!args.full_page)
+    case 'browser_tabs': {
+      const action = String(args.action) as 'list' | 'activate' | 'close'
+      const r = await b.tabs(action, Number(args.index))
+      return r
+    }
+    case 'browser_eval': return b.eval(String(args.script || ''))
+    default: return { ok: false, error: `未知浏览器工具: ${name}` }
   }
 }
 
 /** 执行单个 tool_call */
-export async function executeToolCall(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
+export async function executeToolCall(call: ToolCall, hooks: ExecHooks, deps: ToolDeps): Promise<Record<string, unknown>> {
   const name = call.function?.name
   if (READ_TOOLS.has(name)) {
     switch (name) {
@@ -308,6 +580,9 @@ export async function executeToolCall(call: ToolCall, hooks: ExecHooks): Promise
       case 'read_file': return execRead(call)
       case 'search_files': return execSearch(call)
       case 'web_search': return execWebSearch(call)
+      case 'glob': return execGlob(call)
+      case 'web_fetch': return execWebFetch(call)
+      case 'read_lints': return execReadLints(call)
     }
   }
   if (WRITE_TOOLS.has(name)) {
@@ -315,7 +590,10 @@ export async function executeToolCall(call: ToolCall, hooks: ExecHooks): Promise
       case 'write_file': return execWriteFile(call, hooks)
       case 'edit_file': return execEditFile(call, hooks)
       case 'run_command': return execRunCommand(call, hooks)
+      case 'await_shell': return execAwaitShell(call, hooks, deps)
     }
   }
+  if (PLAN_TOOLS.has(name)) return execTodoWrite(call, deps)
+  if (BROWSER_TOOLS.has(name)) return execBrowser(call, deps)
   return { ok: false, error: `未知工具: ${name}` }
 }

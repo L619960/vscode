@@ -16,6 +16,7 @@ const options = {
   platform: 'browser',
   target: 'chrome120',
   jsx: undefined,
+  resolveExtensions: ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.css', '.json'],
   logLevel: 'info',
   minify: !watch,
   sourcemap: watch ? 'inline' : false,

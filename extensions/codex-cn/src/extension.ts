@@ -7,6 +7,9 @@ import { getApiKey, saveApiKey, getProvider, applyProviderPreset, setConfig, PRO
 import { registerTabCompletion } from './tabCompletion.js'
 import { registerInlineEdit } from './inlineEdit.js'
 import { getCheckpoints, restoreCheckpoint, clearCheckpoints } from './checkpoints.js'
+import { TaskBoard } from './taskBoard.js'
+import { BackgroundShell } from './backgroundShell.js'
+import { BrowserSession } from './browser.js'
 import type { ApprovalDecision, ApprovalRequest } from './executor.js'
 
 let session: Session
@@ -29,6 +32,12 @@ const diffProvider = new DiffContentProvider()
 
 function activate(context: vscode.ExtensionContext): void {
   session = new Session(context.globalState)
+
+  // 有状态工具依赖：任务规划板 / 后台 Shell / 内置浏览器
+  const board = new TaskBoard(context.globalState)
+  const bgShell = new BackgroundShell()
+  const browser = new BrowserSession()
+  context.subscriptions.push({ dispose: () => { bgShell.dispose(); browser.dispose() } })
 
   // 首次启动自动在右侧辅助栏打开 Agent 面板（Cursor 式默认布局），仅一次
   if (!context.globalState.get('codex-cn.autofocused')) {
@@ -72,32 +81,35 @@ function activate(context: vscode.ExtensionContext): void {
   // ---- Webview ----
   const provider = new ChatViewProvider(context.extensionUri, {
     getMessages: () => session.messages,
+    getTodos: () => board.items,
     running: () => cancelSource !== null,
     async send(text: string) {
       if (cancelSource) return
       cancelSource = new vscode.CancellationTokenSource()
-      postToWebview({ type: 'state', messages: session.messages, running: true, checkpoints: getCheckpoints().length })
+      postToWebview({ type: 'state', messages: session.messages, running: true, checkpoints: getCheckpoints().length, todos: board.items })
       const deps: AgentDeps = {
         session,
         getApiKey: () => getApiKey(context.secrets),
         requestApproval,
-        onChange: () => postToWebview({ type: 'state', messages: session.messages, running: cancelSource !== null, checkpoints: getCheckpoints().length }),
+        onChange: () => postToWebview({ type: 'state', messages: session.messages, running: cancelSource !== null, checkpoints: getCheckpoints().length, todos: board.items }),
+        toolDeps: { board, bgShell, browser },
       }
       await runAgent(text, deps, cancelSource.token)
       cancelSource = null
-      postToWebview({ type: 'state', messages: session.messages, running: false, checkpoints: getCheckpoints().length })
+      postToWebview({ type: 'state', messages: session.messages, running: false, checkpoints: getCheckpoints().length, todos: board.items })
     },
     stop() {
       cancelSource?.cancel()
       cancelSource = null
       // 释放所有待审批 Promise（按拒绝处理）
       for (const [id, resolve] of pending) { resolve({ decision: 'deny', reason: '用户停止了任务' }); pending.delete(id) }
-      postToWebview({ type: 'state', messages: session.messages, running: false, checkpoints: getCheckpoints().length })
+      postToWebview({ type: 'state', messages: session.messages, running: false, checkpoints: getCheckpoints().length, todos: board.items })
     },
     clear() {
       session.clear()
       clearCheckpoints()
-      postToWebview({ type: 'state', messages: session.messages, running: false, checkpoints: 0 })
+      board.clear()
+      postToWebview({ type: 'state', messages: session.messages, running: false, checkpoints: 0, todos: [] })
     },
     // 回滚：弹出快照列表（最新在前），选中后恢复对应文件
     async rollback() {
@@ -128,6 +140,7 @@ function activate(context: vscode.ExtensionContext): void {
         provider: c.get('provider'), baseUrl: c.get('baseUrl'), model: c.get('model'),
         supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), tabCompletion: c.get('tabCompletion'), hasKey: !!key,
         presets: Object.fromEntries(Object.entries(PROVIDER_PRESETS).map(([k, v]) => [k, v.label])),
+        presetModels: Object.fromEntries(Object.entries(PROVIDER_PRESETS).map(([k, v]) => [k, v.model])),
       }
     },
     async saveConfig(patch: { provider?: string; baseUrl?: string; model?: string; supportsTools?: string; autoApprove?: boolean; tabCompletion?: boolean; apiKey?: string }) {
@@ -172,6 +185,7 @@ function activate(context: vscode.ExtensionContext): void {
 // ---- Webview View 提供器 ----
 interface Bridge {
   getMessages(): unknown
+  getTodos(): unknown
   running(): boolean
   send(text: string): Promise<void>
   stop(): void
@@ -197,14 +211,25 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     view.webview.onDidReceiveMessage(async (msg: any) => {
       switch (msg.type) {
         case 'ready':
-          view.webview.postMessage({ type: 'state', messages: this.bridge.getMessages(), running: this.bridge.running(), checkpoints: getCheckpoints().length })
+          view.webview.postMessage({ type: 'state', messages: this.bridge.getMessages(), running: this.bridge.running(), checkpoints: getCheckpoints().length, todos: this.bridge.getTodos() })
           break
         case 'send': await this.bridge.send(String(msg.text || '')); break
         case 'stop': this.bridge.stop(); break
         case 'clear': this.bridge.clear(); break
         case 'rollback': await this.bridge.rollback(); break
+        case 'truncateMessages': {
+          session.truncate(Number(msg.index))
+          view.webview.postMessage({ type: 'state', messages: session.messages, running: cancelSource !== null, checkpoints: getCheckpoints().length, todos: this.bridge.getTodos() })
+          break
+        }
         case 'getConfig': view.webview.postMessage({ type: 'config', data: await this.bridge.getConfig() }); break
+        case 'openSettings': void vscode.commands.executeCommand('codexCN.openSettings'); break
         case 'saveConfig': await this.bridge.saveConfig(msg.patch); view.webview.postMessage({ type: 'configSaved' }); break
+        case 'setAgentMode': {
+          const supportsTools = msg.mode === 'chat' ? 'no' : 'auto'
+          await setConfig({ supportsTools })
+          break
+        }
         case 'decision': this.bridge.onDecision(msg); break
         case 'getWorkspaceFiles': {
           const folder = vscode.workspace.workspaceFolders?.[0]

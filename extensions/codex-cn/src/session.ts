@@ -15,6 +15,10 @@ export interface SessionMessage {
   role: 'user' | 'assistant'
   content: string
   time: string
+  /** 消息创建的毫秒时间戳（任务耗时统计用） */
+  ts?: number
+  /** 该消息所属 Agent 任务结束的毫秒时间戳（盖在最后一轮 assistant 消息上） */
+  endTs?: number
   toolRuns?: ToolRun[]
 }
 
@@ -45,13 +49,26 @@ export class Session {
   }
 
   add(msg: SessionMessage): SessionMessage {
+    if (msg.ts === undefined) msg.ts = Date.now()
     this.messages.push(msg)
     this.persist()
     return msg
   }
 
+  /** 移除指定消息（用于空响应续跑时撤下空气泡） */
+  remove(msg: SessionMessage): void {
+    const i = this.messages.indexOf(msg)
+    if (i >= 0) this.messages.splice(i, 1)
+  }
+
   /** 更新当前消息（流式后落盘） */
   save(): void {
+    this.persist()
+  }
+
+  /** 截断：保留前 n 条消息（含），删除之后的；用于从某条消息回退 */
+  truncate(n: number): void {
+    this.messages.splice(n + 1)
     this.persist()
   }
 

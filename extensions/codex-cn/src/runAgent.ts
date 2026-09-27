@@ -3,8 +3,8 @@
 import * as vscode from 'vscode'
 import { chatCompletion } from './llm.js'
 import { getLLMConfig } from './config.js'
-import { TOOL_SCHEMAS, summarizeArgs, summarizeResult } from './tools.js'
-import { executeToolCall, type ApprovalDecision, type ApprovalRequest, type ExecHooks } from './executor.js'
+import { TOOL_SCHEMAS, WRITE_TOOLS, summarizeArgs, summarizeResult } from './tools.js'
+import { executeToolCall, type ApprovalDecision, type ApprovalRequest, type ExecHooks, type ToolDeps } from './executor.js'
 import { buildSystemPrompt } from './prompt.js'
 import { Session, type SessionMessage, type ToolRun } from './session.js'
 import type { ChatMessage, ToolCall } from './types.js'
@@ -12,6 +12,47 @@ import type { ChatMessage, ToolCall } from './types.js'
 const MAX_ROUNDS = 50
 /** 连续 LLM 错误上限：超过则终止任务，避免死循环 */
 const MAX_CONSECUTIVE_ERRORS = 3
+/** 连续空回复（无内容无工具调用）上限：空回复不终止，自动催办继续，超限才停止 */
+const MAX_EMPTY_RESPONSES = 3
+
+/** 截断恢复指令：明确禁止重复巨型调用，强制骨架+分批 edit 工作流 */
+const TRUNCATION_RECOVERY = [
+  '上一次工具调用因参数内容过长，在生成中途被截断（JSON 不完整，服务端无法解析）。',
+  '注意：重复同样的一次性写法必然再次失败，必须立即改为分批写入：',
+  '1. 现在只用 write_file 写入不超过 150 行的可运行骨架（imports、类与函数签名、主界面/主流程结构），未实现的函数体用 pass 或带唯一标记的占位行（如 # TODO: 功能名）；',
+  '2. 然后连续调用多次 edit_file，每批定位一个占位锚点，填充 100-150 行实现；',
+  '3. 重复第 2 步直到功能完整，最后通读自查。',
+  '现在只输出第 1 步的 write_file 骨架调用，不要输出完整实现。',
+].join('\n')
+
+/** write_file 单次行数硬上限：模型提示词遵循不稳定，用代码兜底防截断 */
+const WRITE_FILE_MAX_LINES = 300
+/** edit_file 单批 replace 行数硬上限 */
+const EDIT_BATCH_MAX_LINES = 250
+
+/**
+ * 写类工具规模硬约束：超限时不执行，直接返回错误引导分批写入。
+ * 提示词规则对量化模型约束不可靠（实测 227/278 行均超限），必须代码兜底
+ */
+function enforceWriteSizePolicy(name: string, args: Record<string, unknown>): string {
+  if (name === 'write_file') {
+    const n = String(args.content ?? '').split('\n').length
+    if (n > WRITE_FILE_MAX_LINES) {
+      return `write_file 内容 ${n} 行，超过单次 ${WRITE_FILE_MAX_LINES} 行硬上限——继续生成必然在中途截断。`
+        + '请立即改为：write_file 写不超过 150 行骨架（函数体用 pass/# TODO 占位），再多次 edit_file 每批填充 100-150 行。'
+    }
+  }
+  if (name === 'edit_file' && Array.isArray(args.edits)) {
+    for (let i = 0; i < args.edits.length; i++) {
+      const ed = args.edits[i] as Record<string, unknown>
+      const n = String(ed?.replace ?? '').split('\n').length
+      if (n > EDIT_BATCH_MAX_LINES) {
+        return `edit_file 第 ${i + 1} 个替换内容 ${n} 行，超过单批 ${EDIT_BATCH_MAX_LINES} 行硬上限，请拆成多个 edit 或分多轮调用。`
+      }
+    }
+  }
+  return ''
+}
 
 /** 由扩展实现：审批桥（原生弹窗+Diff）与 webview 状态推送 */
 export interface AgentDeps {
@@ -19,6 +60,7 @@ export interface AgentDeps {
   getApiKey(): Promise<string>
   requestApproval(req: ApprovalRequest): Promise<ApprovalDecision>
   onChange(): void
+  toolDeps: ToolDeps
 }
 
 /** 2 层目录摘要 */
@@ -221,15 +263,18 @@ function truncateToolResult(name: string, result: Record<string, unknown>): Reco
 const TOOL_TIMEOUT_MS = 30000
 
 /** 带超时执行工具：超时返回错误结果而不是挂死主循环 */
-async function executeToolWithTimeout(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
+async function executeToolWithTimeout(call: ToolCall, hooks: ExecHooks, deps: ToolDeps): Promise<Record<string, unknown>> {
   let timer: ReturnType<typeof setTimeout> | undefined
+  // await_shell 等待后台进程（内部上限 60s）；浏览器首启 Edge 较慢
+  const n = call.function?.name || ''
+  const limit = n === 'await_shell' ? 70000 : n.startsWith('browser_') ? 50000 : TOOL_TIMEOUT_MS
   try {
     return await Promise.race([
-      executeToolCall(call, hooks),
+      executeToolCall(call, hooks, deps),
       new Promise<Record<string, unknown>>((resolve) => {
         timer = setTimeout(() => {
-          resolve({ ok: false, error: `工具执行超过 ${TOOL_TIMEOUT_MS / 1000} 秒已超时。请缩小操作范围或换一种方式重试` })
-        }, TOOL_TIMEOUT_MS)
+          resolve({ ok: false, error: `工具执行超过 ${limit / 1000} 秒已超时。请缩小操作范围或换一种方式重试` })
+        }, limit)
       }),
     ])
   } finally {
@@ -258,11 +303,19 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
   const resolvedText = folder ? await resolveAtReferences(userText, folder.uri.fsPath) : userText
   messages.push({ role: 'user', content: resolvedText })
 
+  // 用户消息入会话：作为时间线回合的边界，并在 UI 上显示提问原文
+  deps.session.add({ role: 'user', content: userText, time: deps.session.now() })
+  deps.onChange()
+
   const abort = new AbortController()
   token.onCancellationRequested(() => abort.abort())
 
+  let lastAssistantMsg: SessionMessage | undefined
+  // 流程闸门：本任务是否已通过 todo_write 完成需求拆解
+  let didPlan = false
   try {
     let consecutiveErrors = 0
+    let consecutiveEmpty = 0
     for (let round = 1; round <= MAX_ROUNDS; round++) {
       if (token.isCancellationRequested || abort.signal.aborted) return
 
@@ -272,6 +325,7 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
       const assistantMsg: SessionMessage = deps.session.add({
         role: 'assistant', content: '', time: deps.session.now(), toolRuns: [],
       })
+      lastAssistantMsg = assistantMsg
       deps.onChange()
 
       const result = await chatCompletion({
@@ -303,8 +357,11 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           return
         }
         assistantMsg.content += `\n\n（第 ${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS} 次重试）`
-        // 把错误回喂给 AI 作为 tool 结果，让它理解并修正
-        messages.push({ role: 'user', content: `[系统] 上一次请求出错：${result.error}。请重试或调整方式。` })
+        // 截断类错误：回喂强制分批写入指令；其他错误：泛化回喂让 AI 自行修正
+        const feedback = result.truncated
+          ? `[系统]\n${TRUNCATION_RECOVERY}`
+          : `[系统] 上一次请求出错：${result.error}。请重试或调整方式。`
+        messages.push({ role: 'user', content: feedback })
         deps.session.save()
         deps.onChange()
         continue
@@ -320,10 +377,26 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
       })
 
       if (result.toolCalls.length === 0) {
+        const isEmpty = !(result.content || '').trim()
+        // 空回复不立即终止（量化模型偶发空响应，直接结束会让任务半途而废）：
+        // 撤下空气泡、回喂催办指令，连续超限才停止
+        if (isEmpty && consecutiveEmpty < MAX_EMPTY_RESPONSES) {
+          consecutiveEmpty++
+          messages.pop()
+          deps.session.remove(assistantMsg)
+          messages.push({
+            role: 'user',
+            content: `[系统] 上一次返回了空回复（${consecutiveEmpty}/${MAX_EMPTY_RESPONSES}）。任务尚未完成，请立即继续调用工具完成剩余工作，完成后再总结，禁止空回复。`,
+          })
+          deps.session.save()
+          deps.onChange()
+          continue
+        }
         deps.session.save()
         deps.onChange()
         return
       }
+      consecutiveEmpty = 0
 
       for (const call of result.toolCalls) {
         if (token.isCancellationRequested || abort.signal.aborted) { deps.session.save(); return }
@@ -346,10 +419,15 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         deps.onChange()
 
         if (argsParseError) {
-          // JSON 解析失败：不执行工具，直接把错误回喂给 AI
+          // JSON 解析失败：不执行工具。截断特征（length 结束 / 参数异常长）时回喂分批指令
+          const looksTruncated = result.finishReason === 'length'
+            || (call.function.arguments || '').length > 3000
+          const payload = looksTruncated
+            ? { ok: false, error: `工具参数不完整（${result.finishReason === 'length' ? '触及生成长度上限' : 'JSON 被截断'}）`, recovery: TRUNCATION_RECOVERY }
+            : { ok: false, error: argsParseError }
           run.status = 'error'
-          run.resultJson = JSON.stringify({ ok: false, error: argsParseError })
-          run.resultSummary = '参数 JSON 解析失败'
+          run.resultJson = JSON.stringify(payload)
+          run.resultSummary = looksTruncated ? '参数被截断，需分批写入' : '参数 JSON 解析失败'
           deps.session.save()
           deps.onChange()
           messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
@@ -360,7 +438,35 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           setStatus: (s) => { run.status = s as ToolRun['status']; deps.onChange() },
           requestApproval: (req) => deps.requestApproval(req),
         }
-        const rawResult = await executeToolWithTimeout(call, hooks)
+
+        // 超规模硬拦截：不执行工具，回喂分批写入指令
+        const sizeError = enforceWriteSizePolicy(call.function.name, args)
+        if (sizeError) {
+          run.status = 'error'
+          run.resultJson = JSON.stringify({ ok: false, error: sizeError, recovery: TRUNCATION_RECOVERY })
+          run.resultSummary = '超规模拦截，需分批写入'
+          deps.session.save()
+          deps.onChange()
+          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+          continue
+        }
+
+        // ★流程闸门：写/执行类工具前必须先 todo_write 拆解（本产品六步工作流硬强制）
+        const tname = call.function.name
+        if (tname === 'todo_write') didPlan = true
+        const isBgManage = tname === 'await_shell' && args.action !== 'start'
+        if (!didPlan && WRITE_TOOLS.has(tname) && !isBgManage) {
+          const gateMsg = '流程闸门：调用 write_file / edit_file / run_command / await_shell(start) 之前，必须先调用 todo_write 输出 P0/P1 检查点清单'
+          run.status = 'error'
+          run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: '立即只调用 todo_write（参数 items 为完整检查点数组），再继续执行' })
+          run.resultSummary = '流程闸门：需先规划'
+          deps.session.save()
+          deps.onChange()
+          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+          continue
+        }
+
+        const rawResult = await executeToolWithTimeout(call, hooks, deps.toolDeps)
         const toolResult = truncateToolResult(run.name, withFileNotFoundHint(rawResult))
         run.status = toolResult.ok
           ? 'done'
@@ -381,5 +487,11 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
     deps.onChange()
   } catch (e) {
     vscode.window.showErrorMessage(`Codex CN 内部错误: ${(e as Error).message}`)
+  } finally {
+    // 任务结束（含中途取消/异常）：给最后一轮 assistant 消息盖结束时间戳，供时间线展示耗时
+    if (lastAssistantMsg) {
+      lastAssistantMsg.endTs = Date.now()
+      deps.session.save()
+    }
   }
 }
