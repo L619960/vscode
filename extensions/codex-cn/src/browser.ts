@@ -319,6 +319,96 @@ export class BrowserSession {
     } catch (e) { return { ok: false, error: (e as Error).message } }
   }
 
+  /** 直接执行任意 CDP 命令（如 Network/DOM/Page 域），返回原始 result */
+  async cdpRaw(method: string, params: Record<string, unknown>): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+    try {
+      await this.attachPage()
+      const r = await this.cdp(method, params)
+      return { ok: true, result: r }
+    } catch (e) { return { ok: false, error: (e as Error).message } }
+  }
+
+  /** 按视口坐标点击（不依赖 snapshot 的 ref，适合 canvas/无标签元素） */
+  async mouseClickXY(x: number, y: number): Promise<{ ok: boolean; x: number; y: number; error?: string }> {
+    try {
+      await this.attachPage()
+      const mouse = (type: string): Promise<unknown> =>
+        this.cdp('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 })
+      await mouse('mouseMoved'); await mouse('mousePressed'); await mouse('mouseReleased')
+      await sleep(600)
+      return { ok: true, x, y }
+    } catch (e) { return { ok: false, x, y, error: (e as Error).message } }
+  }
+
+  /** 获取 snapshot 元素的边界框（x/y/width/height），用于坐标点击/拖拽定位 */
+  async getBoundingBox(ref: number): Promise<{ ok: boolean; ref?: number; box?: { x: number; y: number; width: number; height: number }; error?: string }> {
+    const el = this.lastEls.find((x) => x.ref === ref)
+    if (!el) return { ok: false, error: `ref ${ref} 已失效，请重新 browser_snapshot` }
+    try {
+      const expr = `(function(){
+        var e=document.elementFromPoint(${el.cx},${el.cy})
+        if(!e) return JSON.stringify({err:"NO_ELEMENT"})
+        var r=e.getBoundingClientRect()
+        return JSON.stringify({x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height)})
+      })()`
+      const r = await this.cdp('Runtime.evaluate', { expression: expr, returnByValue: true })
+      const out = JSON.parse(r.result?.value || '{}')
+      if (out.err) return { ok: false, error: `ref ${ref} 对应元素不在视口内` }
+      return { ok: true, ref, box: out }
+    } catch (e) { return { ok: false, error: (e as Error).message } }
+  }
+
+  /** 拖拽：从 (fromX,fromY) 拖到 (toX,toY)，分步移动模拟真实手势 */
+  async drag(fromX: number, fromY: number, toX: number, toY: number, steps = 10): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await this.attachPage()
+      await this.cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: fromX, y: fromY, button: 'none' })
+      await this.cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: fromX, y: fromY, button: 'left', clickCount: 1 })
+      for (let i = 1; i <= steps; i++) {
+        const x = Math.round(fromX + (toX - fromX) * i / steps)
+        const y = Math.round(fromY + (toY - fromY) * i / steps)
+        await this.cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'left' })
+        await sleep(20)
+      }
+      await this.cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: toX, y: toY, button: 'left', clickCount: 1 })
+      await sleep(400)
+      return { ok: true }
+    } catch (e) { return { ok: false, error: (e as Error).message } }
+  }
+
+  /** 高亮元素：用 CDP Overlay 域画红色边框，持续 2 秒后自动清除（调试定位用） */
+  async highlight(ref: number): Promise<{ ok: boolean; ref?: number; error?: string }> {
+    const el = this.lastEls.find((x) => x.ref === ref)
+    if (!el) return { ok: false, error: `ref ${ref} 已失效，请重新 browser_snapshot` }
+    try {
+      await this.cdp('DOM.enable')
+      await this.cdp('Overlay.enable')
+      await this.cdp('Overlay.highlightRect', {
+        x: Math.round(el.cx - 1), y: Math.round(el.cy - 1), width: 2, height: 2,
+        color: { r: 255, g: 0, b: 0, a: 0.8 }, outlineColor: { r: 255, g: 0, b: 0, a: 1 },
+      })
+      // 2 秒后清除高亮
+      setTimeout(() => { this.cdp('Overlay.disable').catch(() => undefined); this.cdp('DOM.disable').catch(() => undefined) }, 2000)
+      return { ok: true, ref }
+    } catch (e) { return { ok: false, error: (e as Error).message } }
+  }
+
+  private locked = false
+
+  /** 锁定浏览器：锁定期间除 unlock 外的操作返回错误，防止自动化期间焦点被抢 */
+  lock(): { ok: boolean; locked: boolean } {
+    this.locked = true
+    return { ok: true, locked: true }
+  }
+
+  /** 解锁浏览器 */
+  unlock(): { ok: boolean; locked: boolean } {
+    this.locked = false
+    return { ok: true, locked: false }
+  }
+
+  isLocked(): boolean { return this.locked }
+
   dispose(): void {
     this.detach()
     if (this.edge) {

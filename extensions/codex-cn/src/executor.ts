@@ -464,6 +464,83 @@ async function execDeleteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<
   }
 }
 
+/** 编辑 Jupyter 笔记本（.ipynb）单元格：read/replace_cell/insert_cell/delete_cell */
+async function execEditNotebook(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
+  const args = parseArgs(call)
+  const pathRel = normalizeRel(String(args.path || ''))
+  if (!pathRel.endsWith('.ipynb')) return { ok: false, error: 'edit_notebook 仅支持 .ipynb 文件' }
+  const action = String(args.action || 'read')
+  const uri = toUri(pathRel)
+
+  let nb: any
+  try {
+    nb = JSON.parse(await readText(uri))
+  } catch (e) {
+    return { ok: false, error: `读取/解析 notebook 失败: ${(e as Error).message}` }
+  }
+  if (!Array.isArray(nb.cells)) return { ok: false, error: 'notebook 格式无效：缺少 cells 数组' }
+
+  // read 操作：返回单元格摘要，不走审批
+  if (action === 'read') {
+    const cells = nb.cells.map((c: any, i: number) => ({
+      index: i,
+      type: c.cell_type,
+      source: Array.isArray(c.source) ? c.source.join('') : String(c.source || ''),
+      source_preview: (Array.isArray(c.source) ? c.source.join('') : String(c.source || '')).slice(0, 120),
+    }))
+    return { ok: true, action: 'read', cell_count: cells.length, cells }
+  }
+
+  // 写操作：校验参数
+  const idx = args.cell_index !== undefined ? Number(args.cell_index) : -1
+  if (action === 'replace_cell' || action === 'delete_cell') {
+    if (idx < 0 || idx >= nb.cells.length) return { ok: false, error: `cell_index ${idx} 越界（共 ${nb.cells.length} 个单元格）` }
+  }
+  if (action === 'replace_cell' || action === 'insert_cell') {
+    if (args.source === undefined) return { ok: false, error: `${action} 需要 source 参数` }
+  }
+
+  // 构造新 notebook（仅在内存中，审批通过后才写盘）
+  const newNb = JSON.parse(JSON.stringify(nb))
+  if (action === 'replace_cell') {
+    newNb.cells[idx] = { ...newNb.cells[idx], source: String(args.source).split('\n').map((l: string, i: number, arr: string[]) => i < arr.length - 1 ? l + '\n' : l) }
+  } else if (action === 'insert_cell') {
+    const cellType = args.cell_type === 'markdown' ? 'markdown' : 'code'
+    const newCell = {
+      cell_type: cellType,
+      metadata: {},
+      source: String(args.source).split('\n').map((l: string, i: number, arr: string[]) => i < arr.length - 1 ? l + '\n' : l),
+      ...(cellType === 'code' ? { execution_count: null, outputs: [] } : {}),
+    }
+    if (idx < 0 || idx >= newNb.cells.length) newNb.cells.push(newCell)
+    else newNb.cells.splice(idx, 0, newCell)
+  } else if (action === 'delete_cell') {
+    newNb.cells.splice(idx, 1)
+  } else {
+    return { ok: false, error: `未知 action: ${action}` }
+  }
+
+  // 审批（展示变更摘要）
+  hooks.setStatus('awaiting')
+  const apr = await hooks.requestApproval({
+    toolName: 'edit_notebook', argsSummary: summarizeArgs('edit_notebook', args),
+    path: pathRel,
+    oldContent: JSON.stringify(nb.cells.map((c: any) => c.cell_type + ': ' + (Array.isArray(c.source) ? c.source.join('') : String(c.source || '')).slice(0, 80)), null, 2),
+    newContent: JSON.stringify(newNb.cells.map((c: any) => c.cell_type + ': ' + (Array.isArray(c.source) ? c.source.join('') : String(c.source || '')).slice(0, 80)), null, 2),
+  })
+  if (apr.decision !== 'allow') {
+    return { ok: false, error: `用户拒绝了 notebook 编辑${apr.reason ? '：' + apr.reason : ''}` }
+  }
+
+  try {
+    await saveCheckpoint(uri.fsPath)
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(JSON.stringify(newNb, null, 1)))
+    return { ok: true, action, path: pathRel, cell_count: newNb.cells.length }
+  } catch (e) {
+    return { ok: false, error: `写入 notebook 失败: ${(e as Error).message}` }
+  }
+}
+
 /** ask_user：向用户发起结构化提问，暂停等待回答（复用审批通道，永不被自动审批跳过） */
 async function execAskUser(call: ToolCall, hooks: ExecHooks): Promise<Record<string, unknown>> {
   const args = parseArgs(call)
@@ -605,6 +682,14 @@ async function execBrowser(call: ToolCall, deps: ToolDeps): Promise<Record<strin
   const name = call.function?.name
   const args = parseArgs(call)
   const b = deps.browser
+
+  // lock/unlock 不受锁状态限制
+  if (name === 'browser_lock') return b.lock()
+  if (name === 'browser_unlock') return b.unlock()
+
+  // 锁定期间除解锁外的操作全部拒绝
+  if (b.isLocked()) return { ok: false, error: '浏览器已锁定，请先 browser_unlock' }
+
   switch (name) {
     case 'browser_navigate': return b.navigate(String(args.url || ''), !!args.new_tab)
     case 'browser_snapshot': return b.snapshot()
@@ -617,10 +702,14 @@ async function execBrowser(call: ToolCall, deps: ToolDeps): Promise<Record<strin
     case 'browser_screenshot': return b.screenshot(!!args.full_page)
     case 'browser_tabs': {
       const action = String(args.action) as 'list' | 'activate' | 'close'
-      const r = await b.tabs(action, Number(args.index))
-      return r
+      return await b.tabs(action, Number(args.index))
     }
     case 'browser_eval': return b.eval(String(args.script || ''))
+    case 'browser_cdp': return b.cdpRaw(String(args.method || ''), (args.params && typeof args.params === 'object') ? args.params as Record<string, unknown> : {})
+    case 'browser_mouse_click_xy': return b.mouseClickXY(Number(args.x), Number(args.y))
+    case 'browser_get_bounding_box': return b.getBoundingBox(Number(args.ref))
+    case 'browser_drag': return b.drag(Number(args.from_x), Number(args.from_y), Number(args.to_x), Number(args.to_y), Number(args.steps) || 10)
+    case 'browser_highlight': return b.highlight(Number(args.ref))
     default: return { ok: false, error: `未知浏览器工具: ${name}` }
   }
 }
@@ -692,6 +781,7 @@ export async function executeToolCall(call: ToolCall, hooks: ExecHooks, deps: To
       case 'write_file': return execWriteFile(call, hooks)
       case 'edit_file': return execEditFile(call, hooks)
       case 'delete_file': return execDeleteFile(call, hooks)
+      case 'edit_notebook': return execEditNotebook(call, hooks)
       case 'run_command': return execRunCommand(call, hooks)
       case 'await_shell': return execAwaitShell(call, hooks, deps)
     }

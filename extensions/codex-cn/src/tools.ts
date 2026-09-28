@@ -94,6 +94,24 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'edit_notebook',
+      description: '编辑 Jupyter 笔记本（.ipynb）的单元格。支持读取单元格列表、替换指定单元格内容、在指定位置插入新单元格、删除单元格。修改前会保存快照供回滚。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '相对路径，必须是 .ipynb 文件' },
+          action: { type: 'string', enum: ['read', 'replace_cell', 'insert_cell', 'delete_cell'], description: '操作类型' },
+          cell_index: { type: 'integer', description: '单元格索引（从 0 开始）。replace_cell/delete_cell 必传；insert_cell 表示在此位置前插入，省略则追加到末尾' },
+          cell_type: { type: 'string', enum: ['code', 'markdown'], description: '单元格类型，insert_cell 时使用，默认 code' },
+          source: { type: 'string', description: '单元格内容，replace_cell/insert_cell 时使用' },
+        },
+        required: ['path', 'action'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'run_command',
       description: '在工作区执行 Windows cmd 命令（需用户批准）。30 秒超时，输出截断。用于安装依赖、跑测试、构建等。禁止交互式命令。',
       parameters: {
@@ -431,12 +449,110 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_cdp',
+      description: '直接执行 Chrome DevTools Protocol 命令（如 Network.enable、DOM.getDocument、Page.printToPDF 等）。当 browser_eval 无法满足需求（需要操作网络/渲染/DOM 树）时使用。返回 CDP 原始 result。',
+      parameters: {
+        type: 'object',
+        properties: {
+          method: { type: 'string', description: 'CDP 方法名，如 "Network.enable"、"Page.getCookies"' },
+          params: { type: 'object', description: 'CDP 方法参数对象', additionalProperties: true },
+        },
+        required: ['method'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_mouse_click_xy',
+      description: '按视口坐标点击（不依赖 snapshot 的 ref）。适用于 canvas 绘图、无标签元素、或 browser_click 无法定位的场景。坐标可先用 browser_get_bounding_box 获取。',
+      parameters: {
+        type: 'object',
+        properties: {
+          x: { type: 'integer', description: '视口 X 坐标（像素）' },
+          y: { type: 'integer', description: '视口 Y 坐标（像素）' },
+        },
+        required: ['x', 'y'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_get_bounding_box',
+      description: '获取 snapshot 元素的边界框（x/y/width/height，视口坐标）。用于为 browser_mouse_click_xy 或 browser_drag 提供精确坐标。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref: { type: 'integer', description: '元素编号（来自 browser_snapshot）' },
+        },
+        required: ['ref'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_drag',
+      description: '拖拽：从起点坐标拖到终点坐标，分步移动模拟真实手势。坐标可通过 browser_get_bounding_box 获取。',
+      parameters: {
+        type: 'object',
+        properties: {
+          from_x: { type: 'integer', description: '起点 X 坐标' },
+          from_y: { type: 'integer', description: '起点 Y 坐标' },
+          to_x: { type: 'integer', description: '终点 X 坐标' },
+          to_y: { type: 'integer', description: '终点 Y 坐标' },
+          steps: { type: 'integer', description: '移动步数，默认 10', minimum: 1, maximum: 50 },
+        },
+        required: ['from_x', 'from_y', 'to_x', 'to_y'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_highlight',
+      description: '用红色边框高亮 snapshot 元素（持续约 2 秒），用于调试时确认选中的元素是否正确。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ref: { type: 'integer', description: '元素编号（来自 browser_snapshot）' },
+        },
+        required: ['ref'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_lock',
+      description: '锁定当前浏览器标签，防止自动化操作期间焦点被其他操作抢占。锁定后除 browser_unlock 外的操作会被拒绝。',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_unlock',
+      description: '解锁浏览器标签，恢复正常操作。',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
 ]
 
 export const READ_TOOLS = new Set(['list_dir', 'read_file', 'search_files', 'web_search', 'glob', 'web_fetch', 'read_lints'])
-export const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'run_command', 'await_shell'])
+export const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'edit_notebook', 'run_command', 'await_shell'])
 /** 浏览器工具（无需审批，在沙箱隐藏窗口内执行） */
-export const BROWSER_TOOLS = new Set(['browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_press_key', 'browser_fill', 'browser_select_option', 'browser_scroll', 'browser_screenshot', 'browser_tabs', 'browser_eval'])
+export const BROWSER_TOOLS = new Set([
+  'browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type',
+  'browser_press_key', 'browser_fill', 'browser_select_option', 'browser_scroll',
+  'browser_screenshot', 'browser_tabs', 'browser_eval',
+  'browser_cdp', 'browser_mouse_click_xy', 'browser_get_bounding_box',
+  'browser_drag', 'browser_highlight', 'browser_lock', 'browser_unlock',
+])
 /** 规划类（AI 主动登记，无副作用） */
 export const PLAN_TOOLS = new Set(['todo_write'])
 /** 子代理工具（spawn/await，由 runAgent 特殊处理） */
@@ -452,6 +568,7 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
     case 'edit_file':
       return String(args.path || '')
     case 'delete_file': return String(args.path || '')
+    case 'edit_notebook': return `${args.action} ${args.path}${args.cell_index !== undefined ? `[${args.cell_index}]` : ''}`
     case 'ask_user': return String(args.question || '')
     case 'run_command':
       return String(args.command || '')
@@ -476,6 +593,13 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
     case 'browser_screenshot': return args.full_page ? '整页' : '可视区'
     case 'browser_tabs': return String(args.action || '')
     case 'browser_eval': return String(args.script || '').slice(0, 60)
+    case 'browser_cdp': return String(args.method || '')
+    case 'browser_mouse_click_xy': return `(${args.x},${args.y})`
+    case 'browser_get_bounding_box': return `#${args.ref}`
+    case 'browser_drag': return `(${args.from_x},${args.from_y})→(${args.to_x},${args.to_y})`
+    case 'browser_highlight': return `#${args.ref}`
+    case 'browser_lock': return '锁定'
+    case 'browser_unlock': return '解锁'
     case 'spawn_task': return String(args.task || '').slice(0, 60)
     case 'await_task': return String(args.task_id || '')
     default:
@@ -496,6 +620,9 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
     case 'edit_file':
       return `应用了 ${result.edits_applied ?? 0} 处修改`
     case 'delete_file': return `已删除 ${result.path}`
+    case 'edit_notebook':
+      if (result.action === 'read') return `${result.cell_count ?? 0} 个单元格`
+      return `已${result.action === 'replace_cell' ? '替换' : result.action === 'insert_cell' ? '插入' : '删除'}单元格`
     case 'ask_user': return `用户回答：${String(result.answer || '').slice(0, 80)}`
     case 'run_command':
       return `退出码 ${result.code ?? 0}`
@@ -523,6 +650,13 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
     case 'browser_screenshot': return `截图 ${result.path}`
     case 'browser_tabs': return `${(result.tabs as unknown[])?.length ?? 0} 个标签`
     case 'browser_eval': return '已执行'
+    case 'browser_cdp': return `CDP ${result.method || ''} 已执行`
+    case 'browser_mouse_click_xy': return `已点击 (${result.x},${result.y})`
+    case 'browser_get_bounding_box': return result.box ? `框: ${JSON.stringify(result.box)}` : '获取失败'
+    case 'browser_drag': return '拖拽完成'
+    case 'browser_highlight': return `已高亮 #${result.ref}`
+    case 'browser_lock': return result.locked ? '已锁定' : '已解锁'
+    case 'browser_unlock': return '已解锁'
     case 'spawn_task': return `子任务 ${result.task_id} 已启动`
     case 'await_task': return result.status === 'done' ? `子任务完成：${String(result.result || '').slice(0, 80)}` : `子任务${result.status === 'timeout' ? '超时' : '出错'}`
     default:
