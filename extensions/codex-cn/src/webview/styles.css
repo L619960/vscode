@@ -463,6 +463,43 @@ body {
   flex: 1; min-width: 0; opacity: 0.5;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+
+/* ===== Trae 风格折叠块：左图标 + 标题 + 右侧箭头，默认收起，平滑展开 ===== */
+.tl-head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; line-height: 1.6; opacity: 0.9;
+  cursor: pointer; user-select: none; border-radius: 5px;
+  padding: 1px 4px 1px 0;
+}
+.tl-head:hover { opacity: 1; }
+.tl-head:hover .tl-title { text-decoration: underline; text-underline-offset: 3px; }
+.tl-head.error .tl-title { color: var(--vscode-errorForeground, #f48771); }
+.tl-title { flex: 0 0 auto; opacity: 0.9; }
+.tl-chev {
+  margin-left: auto; flex: 0 0 auto; font-size: 10px; opacity: 0.55;
+  transition: transform 0.22s ease; display: inline-block;
+}
+.tl-chev.open { transform: rotate(90deg); }
+/* 平滑展开：grid rows 0fr→1fr */
+.tl-collapse {
+  display: grid; grid-template-rows: 0fr;
+  transition: grid-template-rows 0.22s ease;
+}
+.tl-collapse.open { grid-template-rows: 1fr; }
+.tl-collapse-inner { overflow: hidden; min-height: 0; }
+
+/* 参考内容块：本地文件路径链接（点击在编辑器打开） */
+.flink {
+  color: var(--vscode-textLink-foreground, #4da3ff);
+  cursor: pointer; text-decoration: none;
+  border-bottom: 1px dashed transparent;
+  word-break: break-all;
+}
+.flink:hover {
+  text-decoration: underline; text-underline-offset: 2px;
+  color: var(--vscode-textLink-activeForeground, #6cb5ff);
+}
+.flink:active { opacity: 0.8; }
 .think-body {
   margin-top: 4px; padding: 6px 9px; border-radius: 6px;
   font-size: 11.5px; line-height: 1.55; opacity: 0.75;

@@ -340,6 +340,13 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
   let lastAssistantMsg: SessionMessage | undefined
   // 流程闸门：本任务是否已通过 todo_write 完成需求拆解
   let didPlan = false
+  // 先读后改闸门：记录已读文件与已改文件（相对路径，统一 \ 为小写便于比较）
+  const normPath = (p: unknown): string => String(p || '').replace(/\//g, '\\').toLowerCase()
+  const readPaths = new Set<string>()
+  const modifiedPaths = new Set<string>()
+  let lastVerifyRound = 0   // 最近一次验证类工具（run_command / read_lints / await_shell）成功所在轮
+  let lastModifyRound = 0   // 最近一次写类工具成功所在轮
+  let verifyReminded = false // 验证提醒只发一次，防止死循环
   try {
     let consecutiveErrors = 0
     let consecutiveEmpty = 0
@@ -414,6 +421,21 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           messages.push({
             role: 'user',
             content: `[系统] 上一次返回了空回复（${consecutiveEmpty}/${MAX_EMPTY_RESPONSES}）。任务尚未完成，请立即继续调用工具完成剩余工作，完成后再总结，禁止空回复。`,
+          })
+          deps.session.save()
+          deps.onChange()
+          continue
+        }
+        // ★验证闸门：改过文件但改后未跑过任何验证（run_command / read_lints / await_shell），
+        // 拦截本次收尾，回喂验证指令（只提醒一次，防止死循环）
+        if (modifiedPaths.size > 0 && lastVerifyRound < lastModifyRound && !verifyReminded) {
+          verifyReminded = true
+          messages.pop() // 撤下这条无工具的 assistant 消息
+          deps.session.remove(assistantMsg)
+          const files = [...modifiedPaths].slice(0, 5).join('、')
+          messages.push({
+            role: 'user',
+            content: `[系统] 验证闸门：你修改了 ${modifiedPaths.size} 个文件（${files}${modifiedPaths.size > 5 ? ' 等' : ''}），但修改后未运行任何验证。请先用 run_command 运行构建/测试/冒烟脚本（GUI 程序用冒烟脚本实例化后销毁，禁止直接跑主入口），或用 read_lints 检查诊断；确认无报错后再收尾汇报。`,
           })
           deps.session.save()
           deps.onChange()
@@ -539,6 +561,26 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           continue
         }
 
+        // ★先读后改闸门：修改已存在的文件前，必须先 read_file 过该文件（防止盲改）
+        if (tname === 'read_file') readPaths.add(normPath(args.path))
+        if ((tname === 'edit_file' || tname === 'write_file' || tname === 'edit_notebook') && args.path) {
+          const np = normPath(args.path)
+          let exists = false
+          if (folder) {
+            try { await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, String(args.path))); exists = true } catch { exists = false }
+          }
+          if (exists && !readPaths.has(np)) {
+            const gateMsg = `先读后改闸门：修改已存在的文件 ${args.path} 之前，必须先调用 read_file 读取它（看清上下文再改，禁止盲改）`
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: `立即调用 read_file（path: "${args.path}"），读完再重新发起本次修改` })
+            run.resultSummary = '先读后改：需先读取该文件'
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+        }
+
         const rawResult = await executeToolWithTimeout(call, hooks, deps.toolDeps)
         const toolResult = truncateToolResult(run.name, withFileNotFoundHint(rawResult))
         run.status = toolResult.ok
@@ -546,6 +588,15 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           : String(toolResult.error || '').startsWith('用户拒绝') ? 'rejected' : 'error'
         run.resultJson = JSON.stringify(toolResult)
         run.resultSummary = summarizeResult(run.name, toolResult)
+        // 追踪修改与验证，供收尾前的验证闸门判断
+        if (toolResult.ok) {
+          if (tname === 'write_file' || tname === 'edit_file' || tname === 'delete_file' || tname === 'edit_notebook') {
+            modifiedPaths.add(normPath(args.path))
+            lastModifyRound = round
+          } else if (tname === 'run_command' || tname === 'read_lints' || tname === 'await_shell') {
+            lastVerifyRound = round
+          }
+        }
         deps.session.save()
         deps.onChange()
 

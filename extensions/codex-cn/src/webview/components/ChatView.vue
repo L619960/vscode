@@ -116,10 +116,10 @@ const GROUP_ICONS: Record<string, string> = {
   run_command: '⚡', search_files: '🔍', web_search: '🌐',
 }
 
-// 折叠状态：van-collapse v-model（存展开的 name）；工具组明细默认展开、记录收起的
+// 折叠状态：van-collapse v-model（存展开的 name）；思考/工具组默认收起（Trae 风格），记录展开的
 const expandedTurns = ref<number[]>([])   // 外层 Agent 回合（执行中的回合默认展开，历史回合默认折叠）
 const thinkActive = ref<string[]>([])     // 思考节点（默认折叠，name 为 回合:节点）
-const groupClosed = ref<Set<string>>(new Set())
+const groupOpen = ref<Set<string>>(new Set())  // 工具组（默认折叠，记录展开的 key）
 const seenTurns = new Set<number>()
 // 注意：模板里 ref 会自动解包，不能把 ref 当参数传递；Set 操作用专用函数
 function flip<T>(setRef: Ref<Set<T>>, key: T): void {
@@ -127,7 +127,36 @@ function flip<T>(setRef: Ref<Set<T>>, key: T): void {
   if (next.has(key)) next.delete(key); else next.add(key)
   setRef.value = next
 }
-const toggleGroup = (key: string): void => flip(groupClosed, key)
+const toggleGroup = (key: string): void => flip(groupOpen, key)
+function flipThink(key: string): void {
+  const i = thinkActive.value.indexOf(key)
+  if (i >= 0) thinkActive.value.splice(i, 1); else thinkActive.value.push(key)
+}
+
+// ---- 参考内容块：本地文件路径渲染为可点击链接，点击在编辑器打开 ----
+type TextPart = { t: 'text' | 'path'; v: string }
+// 绝对路径（盘符前不能紧跟字母数字，避免误匹配 http://）；相对路径须含分隔符或已知扩展名
+const PATH_RE = /(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s'"()（），。；：、【】\[\]<>*?|]+|(?:[\w@.-]+[\\/])+[\w@.-]+\.[A-Za-z0-9]{1,10}\b|\b[\w@.-]+\.(?:ts|js|vue|py|md|json|html|css|txt|bat|ps1|sh|yml|yaml|toml|sql|java|cpp|c|h|go|rs)\b/g
+function linkify(text: string): TextPart[] {
+  const parts: TextPart[] = []
+  let last = 0
+  for (const m of text.matchAll(PATH_RE)) {
+    let v = m[0]
+    // 剥掉尾部标点（路径结尾常见的 . , 等）
+    const trail = /[.,;!?，。；]+$/.exec(v)
+    if (trail) v = v.slice(0, v.length - trail[0].length)
+    if (!v) continue
+    const start = m.index!
+    if (start > last) parts.push({ t: 'text', v: text.slice(last, start) })
+    parts.push({ t: 'path', v })
+    last = start + v.length
+  }
+  if (last < text.length) parts.push({ t: 'text', v: text.slice(last) })
+  return parts
+}
+function openFile(path: string): void {
+  vscodeApi.postMessage({ type: 'openFile', path })
+}
 
 // 任务清单折叠状态（默认展开，name 为回合 index）
 const taskListClosed = ref<Set<number>>(new Set())
@@ -677,9 +706,9 @@ watch(running, (now, prev) => {
         <span>AI 会读项目、改文件、跑命令</span>
       </div>
       <template v-for="(seg, si) in segments" :key="si">
-        <!-- 用户提问：紫色气泡 + 时间 + 操作 -->
+        <!-- 用户提问：紫色气泡 + 时间 + 操作（路径可点击打开） -->
         <div v-if="seg.user" class="msg user">
-          <div class="bubble">{{ seg.user.content }}</div>
+          <div class="bubble"><template v-for="(p, pi) in linkify(seg.user.content)" :key="pi"><a v-if="p.t === 'path'" class="flink" @click="openFile(p.v)">{{ p.v }}</a><span v-else>{{ p.v }}</span></template></div>
           <div class="msg-footer">
             <div class="msg-time">{{ seg.user.time }}</div>
             <div class="msg-actions">
@@ -693,7 +722,7 @@ watch(running, (now, prev) => {
         <!-- 纯闲聊：无工具调用，普通气泡 -->
         <template v-if="!seg.hasTools">
           <div v-for="(s, j) in seg.steps" :key="j" class="msg assistant">
-            <div class="bubble">{{ s.content }}</div>
+            <div class="bubble"><template v-for="(p, pi) in linkify(s.content)" :key="pi"><a v-if="p.t === 'path'" class="flink" @click="openFile(p.v)">{{ p.v }}</a><span v-else>{{ p.v }}</span></template></div>
             <div class="msg-footer">
               <div class="msg-actions">
                 <button class="act-btn" :class="{ done: copiedIdx === si * 10 + j + 1 }" @click="copyMsg(s.content, si * 10 + j + 1)">{{ copiedIdx === si * 10 + j + 1 ? '已复制' : '复制' }}</button>
@@ -761,48 +790,56 @@ watch(running, (now, prev) => {
               <!-- 步骤区（思考、文本、工具、pending） -->
               <div class="agent-steps">
                 <template v-for="(node, ni) in seg.nodes" :key="ni">
-                <!-- 思考：内层 van-collapse，单行预览，点开看全文 -->
-                <van-collapse v-if="node.kind === 'think'" v-model="thinkActive" :border="false" class="inner-collapse">
-                  <van-collapse-item :name="si + ':' + ni">
-                    <template #title>
-                      <div class="think-title">
-                        <span class="think-label">💡 思考</span>
-                        <span v-if="!thinkActive.includes(si + ':' + ni)" class="think-preview">{{ node.text }}</span>
-                      </div>
-                    </template>
-                    <div class="think-body">{{ node.text }}</div>
-                  </van-collapse-item>
-                </van-collapse>
-
-                <!-- 中间说明文本：全文显示 -->
-                <div v-else-if="node.kind === 'text'" class="step">
-                  <div class="step-rail"><span class="step-ico">📄</span></div>
+                <!-- 思考：Trae 风格折叠块，左图标右箭头，默认收起，点击平滑展开 -->
+                <div v-if="node.kind === 'think'" class="step">
+                  <div class="step-rail"><span class="step-ico">💡</span></div>
                   <div class="step-main">
-                    <div class="step-text">{{ node.text }}</div>
+                    <div class="tl-head" @click="flipThink(si + ':' + ni)">
+                      <span class="tl-title">思考</span>
+                      <span v-if="!thinkActive.includes(si + ':' + ni)" class="think-preview">{{ node.text }}</span>
+                      <span class="tl-chev" :class="{ open: thinkActive.includes(si + ':' + ni) }">▸</span>
+                    </div>
+                    <div class="tl-collapse" :class="{ open: thinkActive.includes(si + ':' + ni) }">
+                      <div class="tl-collapse-inner">
+                        <div class="think-body"><template v-for="(p, pi) in linkify(node.text)" :key="pi"><a v-if="p.t === 'path'" class="flink" @click="openFile(p.v)">{{ p.v }}</a><span v-else>{{ p.v }}</span></template></div>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
-                <!-- 工具聚合组：明细直接可见 -->
+                <!-- 中间说明文本：全文显示（路径可点击） -->
+                <div v-else-if="node.kind === 'text'" class="step">
+                  <div class="step-rail"><span class="step-ico">📄</span></div>
+                  <div class="step-main">
+                    <div class="step-text"><template v-for="(p, pi) in linkify(node.text)" :key="pi"><a v-if="p.t === 'path'" class="flink" @click="openFile(p.v)">{{ p.v }}</a><span v-else>{{ p.v }}</span></template></div>
+                  </div>
+                </div>
+
+                <!-- 工具聚合组：Trae 风格折叠块，默认收起只显示标题，点击平滑展开明细 -->
                 <div v-else-if="node.kind === 'group'" class="step">
                   <div class="step-rail"><span class="step-ico">{{ GROUP_ICONS[node.group.name] || '🔧' }}</span></div>
                   <div class="step-main">
-                    <div class="step-title clickable" :class="{ error: node.group.hasError }" @click="toggleGroup(si + ':' + ni)">
-                      {{ node.group.label }}
-                      <span class="chev">{{ groupClosed.has(si + ':' + ni) ? '▸' : '▾' }}</span>
+                    <div class="tl-head" :class="{ error: node.group.hasError }" @click="toggleGroup(si + ':' + ni)">
+                      <span class="tl-title">{{ node.group.label }}</span>
+                      <span class="tl-chev" :class="{ open: groupOpen.has(si + ':' + ni) }">▸</span>
                     </div>
-                    <div v-if="!groupClosed.has(si + ':' + ni)" class="group-detail">
-                      <!-- 变更卡片：写/编辑类工具带 +N -M 统计 -->
-                      <div v-for="t in node.group.runs" :key="t.id" class="gd-row" :class="t.status">
-                        <span class="gd-name">{{ TOOL_LABELS[t.name] || t.name }}</span>
-                        <span class="gd-args">{{ t.argsSummary }}</span>
-                        <template v-if="diffStat(t)">
-                          <span class="gd-diff-add">+{{ diffStat(t)!.add }}</span>
-                          <span class="gd-diff-del">-{{ diffStat(t)!.del }}</span>
-                        </template>
-                        <span class="gd-badge" :class="t.status">{{
-                          t.status === 'done' ? '完成' : t.status === 'rejected' ? '已拒绝' : '失败'
-                        }}</span>
-                        <div v-if="t.status !== 'done' && t.resultSummary" class="gd-result">{{ t.resultSummary }}</div>
+                    <div class="tl-collapse" :class="{ open: groupOpen.has(si + ':' + ni) }">
+                      <div class="tl-collapse-inner">
+                        <div class="group-detail">
+                          <!-- 变更卡片：写/编辑类工具带 +N -M 统计 -->
+                          <div v-for="t in node.group.runs" :key="t.id" class="gd-row" :class="t.status">
+                            <span class="gd-name">{{ TOOL_LABELS[t.name] || t.name }}</span>
+                            <span class="gd-args"><template v-for="(p, pi) in linkify(t.argsSummary)" :key="pi"><a v-if="p.t === 'path'" class="flink" @click.stop="openFile(p.v)">{{ p.v }}</a><span v-else>{{ p.v }}</span></template></span>
+                            <template v-if="diffStat(t)">
+                              <span class="gd-diff-add">+{{ diffStat(t)!.add }}</span>
+                              <span class="gd-diff-del">-{{ diffStat(t)!.del }}</span>
+                            </template>
+                            <span class="gd-badge" :class="t.status">{{
+                              t.status === 'done' ? '完成' : t.status === 'rejected' ? '已拒绝' : '失败'
+                            }}</span>
+                            <div v-if="t.status !== 'done' && t.resultSummary" class="gd-result">{{ t.resultSummary }}</div>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -851,11 +888,11 @@ watch(running, (now, prev) => {
             </div>
           </van-collapse-item>
 
-          <!-- ✅ 最终回复：放在 van-collapse-item 外面，永远可见！ -->
+          <!-- ✅ 最终回复：放在 van-collapse-item 外面，永远可见！（路径可点击） -->
           <div v-if="seg.finalReply" class="step reply-step final-reply">
             <div class="step-rail"><span class="step-ico end"></span></div>
             <div class="step-main">
-              <div class="reply-body">{{ seg.finalReply }}</div>
+              <div class="reply-body"><template v-for="(p, pi) in linkify(seg.finalReply)" :key="pi"><a v-if="p.t === 'path'" class="flink" @click="openFile(p.v)">{{ p.v }}</a><span v-else>{{ p.v }}</span></template></div>
             </div>
           </div>
         </van-collapse>

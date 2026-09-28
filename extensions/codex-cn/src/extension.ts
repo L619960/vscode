@@ -323,6 +323,18 @@ function activate(context: vscode.ExtensionContext): void {
       case 'getConfig': void webview.postMessage({ type: 'config', data: await getConfig() }); break
       case 'openSettings': void vscode.commands.executeCommand('codex-cn.openSettingsTab'); break
       case 'openSettingsTab': void vscode.commands.executeCommand('codex-cn.openSettingsTab'); break
+      case 'openFile': {
+        // 聊天里的文件路径链接：绝对路径直接开，相对路径拼工作区
+        const p = String(msg.path || '')
+        if (!p) break
+        const isAbs = /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('\\\\') || p.startsWith('/')
+        const root = vscode.workspace.workspaceFolders?.[0]?.uri
+        const uri = isAbs ? vscode.Uri.file(p) : root ? vscode.Uri.joinPath(root, p) : vscode.Uri.file(p)
+        void vscode.window.showTextDocument(uri, { preview: true }).then(undefined, () => {
+          void vscode.window.showWarningMessage(`无法打开文件: ${p}`)
+        })
+        break
+      }
       case 'saveConfig':
         await saveConfig(msg.patch)
         void webview.postMessage({ type: 'configSaved' })
