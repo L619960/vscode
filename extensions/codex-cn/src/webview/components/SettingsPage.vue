@@ -357,6 +357,14 @@ function asNumber(e: Event): number { return Number((e.target as HTMLInputElemen
             <input type="checkbox" class="tg" :checked="!!cfg.planMode"
               @change="patch({ planMode: asChecked($event) })" />
           </div>
+          <div class="row">
+            <div class="row-txt">
+              <div class="row-name">Superpowers 方法论</div>
+              <div class="row-desc">复杂任务先头脑风暴澄清需求 → 规格 → 计划 → TDD → 代码评审再交付（obra/superpowers v6.4.2）。会增加上下文占用，简单任务无需开启</div>
+            </div>
+            <input type="checkbox" class="tg" :checked="!!cfg.superpowers"
+              @change="patch({ superpowers: asChecked($event) })" />
+          </div>
           <div class="set-note">⚠️ <strong>rm -rf、del /s、format、shutdown</strong> 等危险命令始终需要人工确认，自动审批不覆盖危险操作</div>
         </div>
       </section>

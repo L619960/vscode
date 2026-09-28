@@ -150,6 +150,11 @@
           "default": false,
           "description": "计划确认模式：AI 执行写文件/命令前必须先提交实施方案并获你批准（对标 Trae Plan 模式）"
         },
+        "codex-cn.superpowers": {
+          "type": "boolean",
+          "default": false,
+          "description": "Superpowers 方法论（obra/superpowers v6.4.2）：复杂任务先头脑风暴澄清需求→规格→计划→TDD→代码评审再交付。会增加上下文占用，简单任务无需开启"
+        },
         "codex-cn.mcpServers": {
           "type": "object",
           "default": {},

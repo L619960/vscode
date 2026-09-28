@@ -70,6 +70,8 @@ export interface AgentDeps {
   skills?: SkillsStore
   /** 计划确认模式：开启后写/执行类工具必须先经 submit_plan 获用户批准 */
   planMode?: boolean
+  /** Superpowers 方法论：开启后以技能优先 + brainstorm/TDD/评审流程替代默认六步工作流 */
+  superpowers?: boolean
   /** MCP 工具管理器：外部工具服务器（动态扩展工具集） */
   mcp?: McpManager
   /** 跨会话用户记忆写入 */
@@ -188,7 +190,8 @@ async function resolveAtReferences(text: string, workspaceRoot: string): Promise
 
 /** 技能索引：只把名称+一句话预览注入系统提示，完整内容用 load_skill 按需加载（省每轮 token） */
 /** 支持项目级过滤：仅列出与当前项目关联的技能，无关联时回退到全部技能（避免 Agent 无技能可用） */
-async function buildSkillIndex(skills?: SkillsStore, workspaceRoot?: string): Promise<string> {
+/** Superpowers 开启时：追加内置技能分组（个人技能 + Superpowers 技能） */
+async function buildSkillIndex(skills?: SkillsStore, workspaceRoot?: string, superpowers?: boolean): Promise<string> {
   if (!skills) return ''
   try {
     let list = await skills.list()
@@ -201,8 +204,19 @@ async function buildSkillIndex(skills?: SkillsStore, workspaceRoot?: string): Pr
       }
       // linked 为空（未配置或全取消）→ 显示全部技能，避免 Agent 无技能可用
     }
-    if (!list.length) return ''
-    return list.map(s => `- ${s.name.replace(/\.md$/, '')}：${(s.preview || '').split('\n')[0].slice(0, 60)}`).join('\n')
+    const personal = list.map(s => `- ${s.name.replace(/\.md$/, '')}：${(s.preview || '').split('\n')[0].slice(0, 60)}`)
+
+    if (superpowers) {
+      const sections: string[] = []
+      if (personal.length) sections.push(`【个人技能】\n${personal.join('\n')}`)
+      const vendor = await skills.listVendor()
+      if (vendor.length) {
+        sections.push('【Superpowers 内置技能】（load_skill 的 name 用下列英文目录名；需附属文件时加 file 参数）\n'
+          + vendor.map(v => `- ${v.name}：${v.description}`).join('\n'))
+      }
+      return sections.join('\n\n')
+    }
+    return personal.join('\n')
   } catch { return '' }
 }
 
@@ -216,14 +230,14 @@ function detectTaskType(text: string): string | undefined {
 }
 
 async function buildApiMessages(
-  session: Session, skills?: SkillsStore, planMode?: boolean, userMemory?: string, resolvedText?: string
+  session: Session, skills?: SkillsStore, planMode?: boolean, userMemory?: string, resolvedText?: string, superpowers?: boolean
 ): Promise<ChatMessage[]> {
   const folder = vscode.workspace.workspaceFolders?.[0]
   const wsName = folder?.name || '（无）'
   const dirSummary = await buildDirSummary()
-  const skillIndex = await buildSkillIndex(skills, folder?.uri.fsPath)
+  const skillIndex = await buildSkillIndex(skills, folder?.uri.fsPath, superpowers)
   const taskType = resolvedText ? detectTaskType(resolvedText) : undefined
-  const systemPrompt = await buildSystemPrompt(wsName, dirSummary, folder?.uri.fsPath, skillIndex, planMode, userMemory, taskType)
+  const systemPrompt = await buildSystemPrompt(wsName, dirSummary, folder?.uri.fsPath, skillIndex, planMode, userMemory, taskType, superpowers)
   const systemMsg: ChatMessage = { role: 'system', content: systemPrompt }
 
   const all: ChatMessage[] = []
@@ -371,7 +385,7 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
   const folder = vscode.workspace.workspaceFolders?.[0]
   const resolvedText = folder ? await resolveAtReferences(userText, folder.uri.fsPath) : userText
   const userMemory = deps.getUserMemory ? await deps.getUserMemory() : ''
-  let messages = await buildApiMessages(deps.session, deps.skills, deps.planMode, userMemory, resolvedText)
+  let messages = await buildApiMessages(deps.session, deps.skills, deps.planMode, userMemory, resolvedText, deps.superpowers)
   messages.push({ role: 'user', content: resolvedText })
 
   // 用户消息入会话：作为时间线回合的边界，并在 UI 上显示提问原文
@@ -735,26 +749,63 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         // ★技能加载：load_skill 由 runAgent 特殊处理（直接读 SkillsStore，内容作为工具结果进入上下文）
         if (tname === 'load_skill') {
           const rawName = String(args.name || '').trim()
+          // vendor 技能附属文件（如 references/xxx.md）；个人技能不用此参数
+          const vendorFile = args.file ? String(args.file).trim() : undefined
           const fileName = rawName.endsWith('.md') ? rawName : `${rawName}.md`
-          if (!deps.skills) {
-            run.status = 'error'
-            run.resultJson = JSON.stringify({ ok: false, error: '技能库未初始化' })
-            run.resultSummary = '技能库不可用'
-          } else if (loadedSkills.has(fileName)) {
-            run.status = 'done'
-            run.resultJson = JSON.stringify({ ok: true, name: rawName, note: '该技能已加载过，完整内容见上文工具结果，请勿重复加载' })
-            run.resultSummary = `技能「${rawName}」已加载过`
-          } else {
-            try {
-              const content = await deps.skills.read(fileName)
-              loadedSkills.add(fileName)
+          let loaded = false
+
+          // 1) 个人技能优先（现有技能库；读不到则落到 vendor）
+          if (deps.skills && !vendorFile) {
+            const pkey = `personal:${fileName}`
+            if (loadedSkills.has(pkey)) {
               run.status = 'done'
-              run.resultJson = JSON.stringify({ ok: true, name: rawName, content })
-              run.resultSummary = `已加载技能「${rawName}」`
-            } catch (e) {
+              run.resultJson = JSON.stringify({ ok: true, name: rawName, note: '该技能已加载过，完整内容见上文工具结果，请勿重复加载' })
+              run.resultSummary = `技能「${rawName}」已加载过`
+              loaded = true
+            } else {
+              try {
+                const content = await deps.skills.read(fileName)
+                loadedSkills.add(pkey)
+                run.status = 'done'
+                run.resultJson = JSON.stringify({ ok: true, name: rawName, content })
+                run.resultSummary = `已加载技能「${rawName}」`
+                loaded = true
+              } catch { /* 个人技能不存在，继续尝试 vendor */ }
+            }
+          }
+
+          // 2) Superpowers 内置技能（英文目录名；file 参数可读 references 等附属文件）
+          if (!loaded) {
+            const vendorName = rawName.replace(/\.md$/, '')
+            if (!deps.skills || !deps.superpowers) {
               run.status = 'error'
-              run.resultJson = JSON.stringify({ ok: false, error: `技能不存在或不可读: ${fileName}（${(e as Error).message}）`, recovery: '从系统提示的技能索引中选择存在的名称重试' })
+              run.resultJson = JSON.stringify({ ok: false, error: `技能不存在或不可读: ${rawName}`, recovery: '从系统提示的技能索引中选择存在的名称重试' })
               run.resultSummary = '技能不存在'
+            } else {
+              const vkey = `vendor:${vendorName}:${vendorFile || 'SKILL.md'}`
+              if (loadedSkills.has(vkey)) {
+                run.status = 'done'
+                run.resultJson = JSON.stringify({ ok: true, name: vendorName, file: vendorFile, note: '该文件已加载过，内容见上文工具结果，请勿重复加载' })
+                run.resultSummary = `「${vendorName}」已加载过`
+              } else {
+                try {
+                  const content = await deps.skills.readVendor(vendorName, vendorFile)
+                  loadedSkills.add(vkey)
+                  run.status = 'done'
+                  run.resultJson = JSON.stringify({ ok: true, name: vendorName, file: vendorFile, content })
+                  run.resultSummary = vendorFile
+                    ? `已加载「${vendorName}/${vendorFile}」`
+                    : `已加载 Superpowers 技能「${vendorName}」`
+                  // 流程闸门兼容：进入头脑风暴/计划技能即接管规划纪律，不再强制 todo_write 先行
+                  if (!vendorFile && (vendorName === 'brainstorming' || vendorName === 'writing-plans')) {
+                    didPlan = true
+                  }
+                } catch (e) {
+                  run.status = 'error'
+                  run.resultJson = JSON.stringify({ ok: false, error: `技能不存在或不可读: ${vendorName}${vendorFile ? `/${vendorFile}` : ''}（${(e as Error).message}）`, recovery: '从系统提示的 Superpowers 技能索引中选择存在的名称重试' })
+                  run.resultSummary = '技能不存在'
+                }
+              }
             }
           }
           deps.session.save()

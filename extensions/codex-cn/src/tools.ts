@@ -218,11 +218,12 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'load_skill',
-      description: '按需加载技能（领域知识/流程手册）的完整内容。系统提示中列出了可用技能索引，任务命中某技能场景时调用一次即可，内容会进入本轮上下文。',
+      description: '按需加载技能（领域知识/流程手册）的完整内容。系统提示中列出了可用技能索引（个人技能与 Superpowers 内置技能），任务命中某技能场景时调用一次即可，内容会进入本轮上下文。Superpowers 技能需要 references 附属文件时可用 file 参数再次加载。',
       parameters: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: '技能名（索引中列出的名称，.md 后缀可省略）' },
+          name: { type: 'string', description: '技能名（索引中列出的名称；个人技能 .md 后缀可省略，Superpowers 技能用英文目录名）' },
+          file: { type: 'string', description: '可选：Superpowers 技能的附属文件相对路径（如 references/xxx.md），默认读取 SKILL.md' },
         },
         required: ['name'],
       },

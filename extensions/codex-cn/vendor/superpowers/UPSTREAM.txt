@@ -1,0 +1,4 @@
+﻿upstream: https://github.com/obra/superpowers
+version: 6.4.2
+commit: 8ca22dba9a94f28898bbce59f2537ff4d87c747d
+vendored: 2026-09-28

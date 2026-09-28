@@ -54,8 +54,9 @@ function activate(context: vscode.ExtensionContext): void {
   )
   session = manager.active
 
-  // 技能库：globalStorage/skills 真实 .md 文件
-  const skills = new SkillsStore(context.globalStorageUri)
+  // 技能库：globalStorage/skills 真实 .md 文件 + 扩展内置 vendor/superpowers 技能
+  const vendorRoot = vscode.Uri.joinPath(context.extensionUri, 'vendor', 'superpowers', 'skills')
+  const skills = new SkillsStore(context.globalStorageUri, vendorRoot)
   void skills.ensure()
 
   // 跨会话用户记忆：globalStorage/user_memory.md（一行一条偏好，注入系统提示词）
@@ -187,6 +188,7 @@ function activate(context: vscode.ExtensionContext): void {
       skills,
       mcp,
       planMode: vscode.workspace.getConfiguration('codex-cn').get<boolean>('planMode', false),
+      superpowers: vscode.workspace.getConfiguration('codex-cn').get<boolean>('superpowers', false),
       getUserMemory,
       saveUserMemory,
     }
@@ -251,7 +253,7 @@ function activate(context: vscode.ExtensionContext): void {
     const s = getAgentSettings()
     return {
       provider: c.get('provider'), baseUrl: c.get('baseUrl'), model: c.get('model'),
-      supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), planMode: c.get('planMode'), tabCompletion: c.get('tabCompletion'), hasKey: !!key,
+      supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), planMode: c.get('planMode'), superpowers: c.get('superpowers'), tabCompletion: c.get('tabCompletion'), hasKey: !!key,
       // 工具开关 / 隐私 / 对话流
       toolRead: s.toolRead, toolWrite: s.toolWrite, toolShell: s.toolShell,
       toolBrowser: s.toolBrowser, toolWeb: s.toolWeb, privacyMode: s.privacyMode,
@@ -263,7 +265,7 @@ function activate(context: vscode.ExtensionContext): void {
 
   type ConfigPatch = {
     provider?: string; baseUrl?: string; model?: string; supportsTools?: string
-    autoApprove?: boolean; planMode?: boolean; tabCompletion?: boolean; apiKey?: string
+    autoApprove?: boolean; planMode?: boolean; superpowers?: boolean; tabCompletion?: boolean; apiKey?: string
     toolRead?: boolean; toolWrite?: boolean; toolShell?: boolean; toolBrowser?: boolean; toolWeb?: boolean
     privacyMode?: boolean; maxMessages?: number; autoTitle?: boolean; maxSessions?: number
   }
@@ -278,6 +280,7 @@ function activate(context: vscode.ExtensionContext): void {
     if (patch.supportsTools !== undefined) rest.supportsTools = patch.supportsTools
     if (patch.autoApprove !== undefined) rest.autoApprove = patch.autoApprove
     if (patch.planMode !== undefined) rest.planMode = patch.planMode
+    if (patch.superpowers !== undefined) rest.superpowers = patch.superpowers
     if (patch.tabCompletion !== undefined) rest.tabCompletion = patch.tabCompletion
     if (patch.toolRead !== undefined) rest.toolRead = patch.toolRead
     if (patch.toolWrite !== undefined) rest.toolWrite = patch.toolWrite

@@ -15,6 +15,16 @@ export interface SkillMeta {
   content: string
 }
 
+/** Vendored 技能（Superpowers 等内置框架）列表项 */
+export interface VendorSkillMeta {
+  /** 技能目录名（load_skill 的 name 参数） */
+  name: string
+  /** frontmatter 中的名称 */
+  title: string
+  /** frontmatter 描述（一句话，用于技能索引） */
+  description: string
+}
+
 /** 单个技能文件大小上限（字符），防止误贴巨型内容 */
 const MAX_SKILL_CHARS = 8000
 
@@ -24,6 +34,24 @@ const MAX_SKILL_CHARS = 8000
  */
 export function safeSkillName(name: string): boolean {
   return /^[\w一-龥][\w一-龥\- ]{0,40}\.md$/.test(name)
+}
+
+/** 解析 Markdown frontmatter（--- 包裹的简单 key: value，值去首尾引号） */
+function parseFrontmatter(text: string): Record<string, string> {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)
+  const out: Record<string, string> = {}
+  if (!m) return out
+  for (const line of m[1].split(/\r?\n/)) {
+    const idx = line.indexOf(':')
+    if (idx <= 0) continue
+    const key = line.slice(0, idx).trim()
+    let val = line.slice(idx + 1).trim()
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1)
+    }
+    out[key] = val
+  }
+  return out
 }
 
 /** 内置技能：首次启动写入真实文件 */
@@ -60,9 +88,12 @@ const BUILTIN: Array<{ name: string; content: string }> = [
 
 export class SkillsStore {
   private readonly dirUri: vscode.Uri
+  /** 内置 vendored 技能根目录（如扩展内 vendor/superpowers/skills）；无则不支持 vendor 技能 */
+  private readonly vendorRoot?: vscode.Uri
 
-  constructor(globalStorageUri: vscode.Uri) {
+  constructor(globalStorageUri: vscode.Uri, vendorRoot?: vscode.Uri) {
     this.dirUri = vscode.Uri.joinPath(globalStorageUri, 'skills')
+    this.vendorRoot = vendorRoot
   }
 
   /** 确保目录存在；目录为空时写入内置技能（幂等） */
@@ -209,5 +240,46 @@ export class SkillsStore {
       ...skill,
       linked: linked.includes(skill.name),
     }))
+  }
+
+  // ---- Vendored 技能（内置 Superpowers 框架；只读，不允许用户增删改）----
+
+  /** 列出 vendored 技能（按目录名排序） */
+  async listVendor(): Promise<VendorSkillMeta[]> {
+    if (!this.vendorRoot) return []
+    let entries: [string, vscode.FileType][]
+    try { entries = await vscode.workspace.fs.readDirectory(this.vendorRoot) } catch { return [] }
+    const metas: VendorSkillMeta[] = []
+    for (const [name, type] of entries) {
+      if (type !== vscode.FileType.Directory) continue
+      let text = ''
+      try { text = await this.readVendor(name) } catch { continue }
+      const fm = parseFrontmatter(text)
+      metas.push({
+        name,
+        title: fm.name || name,
+        description: (fm.description || '').slice(0, 100),
+      })
+    }
+    return metas.sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  /**
+   * 读取 vendored 技能文件：默认 SKILL.md；file 参数可读 references 等附属文件。
+   * 路径限定在该技能目录内，禁止 .. 逃逸。
+   */
+  async readVendor(name: string, file?: string): Promise<string> {
+    if (!this.vendorRoot) throw new Error('无内置技能目录')
+    if (!/^[\w-]{1,40}$/.test(name)) throw new Error('非法技能名')
+    const relFile = file ? String(file).replace(/^[/\\]+/, '') : 'SKILL.md'
+    if (relFile.includes('..')) throw new Error('非法文件路径')
+    const segments = relFile.split(/[/\\]/).filter(Boolean)
+    const uri = vscode.Uri.joinPath(this.vendorRoot, name, ...segments)
+    try {
+      const buf = await vscode.workspace.fs.readFile(uri)
+      return new TextDecoder('utf-8').decode(buf)
+    } catch {
+      throw new Error(`技能文件不存在：${name}/${relFile}`)
+    }
   }
 }
