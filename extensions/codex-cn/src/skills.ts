@@ -144,4 +144,70 @@ export class SkillsStore {
     if (!safeSkillName(name)) throw new Error('非法技能文件名')
     await vscode.workspace.fs.delete(vscode.Uri.joinPath(this.dirUri, name))
   }
+
+  // ---- 项目级技能关联：.agent/linked-skills.json ----
+
+  /** 项目关联配置文件路径 */
+  private getProjectConfigUri(workspaceRoot: string): vscode.Uri {
+    return vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), '.agent', 'linked-skills.json')
+  }
+
+  /** 确保项目配置目录存在 */
+  private async ensureProjectConfig(workspaceRoot: string): Promise<void> {
+    const agentDir = vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), '.agent')
+    try {
+      await vscode.workspace.fs.createDirectory(agentDir)
+    } catch { /* 已存在 */ }
+  }
+
+  /** 读取项目关联的技能列表 */
+  async getLinkedSkills(workspaceRoot: string): Promise<string[]> {
+    try {
+      const uri = this.getProjectConfigUri(workspaceRoot)
+      const buf = await vscode.workspace.fs.readFile(uri)
+      const data = JSON.parse(Buffer.from(buf).toString('utf-8'))
+      return Array.isArray(data.linked) ? data.linked : []
+    } catch {
+      return []
+    }
+  }
+
+  /** 批量关联技能到项目 */
+  async linkSkills(workspaceRoot: string, names: string[]): Promise<void> {
+    await this.ensureProjectConfig(workspaceRoot)
+    const linked = await this.getLinkedSkills(workspaceRoot)
+    const newLinked = [...new Set([...linked, ...names])]
+    await this.writeProjectConfig(workspaceRoot, newLinked)
+  }
+
+  /** 批量取消技能关联 */
+  async unlinkSkills(workspaceRoot: string, names: string[]): Promise<void> {
+    await this.ensureProjectConfig(workspaceRoot)
+    const linked = await this.getLinkedSkills(workspaceRoot)
+    const newLinked = linked.filter(n => !names.includes(n))
+    await this.writeProjectConfig(workspaceRoot, newLinked)
+  }
+
+  /** 写入项目关联配置 */
+  private async writeProjectConfig(workspaceRoot: string, linked: string[]): Promise<void> {
+    const uri = this.getProjectConfigUri(workspaceRoot)
+    const data = {
+      version: 1,
+      linked,
+      updatedAt: new Date().toISOString(),
+    }
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(JSON.stringify(data, null, 2)))
+  }
+
+  /** 列出技能并附带项目关联状态 */
+  async listWithStatus(workspaceRoot: string): Promise<Array<SkillMeta & { linked: boolean }>> {
+    const [all, linked] = await Promise.all([
+      this.list(),
+      this.getLinkedSkills(workspaceRoot),
+    ])
+    return all.map(skill => ({
+      ...skill,
+      linked: linked.includes(skill.name),
+    }))
+  }
 }

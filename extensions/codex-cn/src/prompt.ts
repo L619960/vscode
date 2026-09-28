@@ -94,7 +94,7 @@ ${dirSummary || '（尚未加载，先用 list_dir 探索）'}
 
   // 技能索引：只列名称与一句话预览，完整内容由模型用 load_skill 按需加载
   if (skillIndex) {
-    systemPrompt += `\n\n## 可用技能（索引；任务命中场景时调用 load_skill 加载完整内容，禁止凭名称臆测内容）\n${skillIndex}`
+    systemPrompt += `\n\n## 可用技能（仅列出已关联到当前项目的技能；任务命中场景时调用 load_skill 加载完整内容，禁止凭名称臆测内容）\n${skillIndex}`
   }
 
   // 项目记忆：.agent/memory.md 沉淀的跨会话约定与决策，启动时注入

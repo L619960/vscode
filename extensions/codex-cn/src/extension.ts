@@ -423,10 +423,17 @@ function activate(context: vscode.ExtensionContext): void {
         break
       }
       // ---- 技能库：全部操作真实落盘到 globalStorage/skills ----
-      case 'listSkills':
-        try { void webview.postMessage({ type: 'skills', seq: msg.seq, items: await skills.list() }) }
-        catch (e) { void webview.postMessage({ type: 'skills', seq: msg.seq, error: (e as Error).message }) }
+      case 'listSkills': {
+        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+        try {
+          if (wsRoot) {
+            void webview.postMessage({ type: 'skills', seq: msg.seq, items: await skills.listWithStatus(wsRoot) })
+          } else {
+            void webview.postMessage({ type: 'skills', seq: msg.seq, items: await skills.list() })
+          }
+        } catch (e) { void webview.postMessage({ type: 'skills', seq: msg.seq, error: (e as Error).message }) }
         break
+      }
       case 'readSkill':
         try { void webview.postMessage({ type: 'skillContent', seq: msg.seq, name: msg.name, content: await skills.read(String(msg.name)) }) }
         catch (e) { void webview.postMessage({ type: 'skillContent', seq: msg.seq, error: (e as Error).message }) }
@@ -455,6 +462,30 @@ function activate(context: vscode.ExtensionContext): void {
         }
         catch (e) { void webview.postMessage({ type: 'skillChanged', seq: msg.seq, error: (e as Error).message }) }
         break
+      case 'linkSkills': {
+        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+        try {
+          if (wsRoot) {
+            await skills.linkSkills(wsRoot, msg.names as string[])
+            void webview.postMessage({ type: 'skillsLinked', seq: msg.seq })
+          } else {
+            void webview.postMessage({ type: 'skillsLinked', seq: msg.seq, error: '无工作区，无法关联技能' })
+          }
+        } catch (e) { void webview.postMessage({ type: 'skillsLinked', seq: msg.seq, error: (e as Error).message }) }
+        break
+      }
+      case 'unlinkSkills': {
+        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+        try {
+          if (wsRoot) {
+            await skills.unlinkSkills(wsRoot, msg.names as string[])
+            void webview.postMessage({ type: 'skillsLinked', seq: msg.seq })
+          } else {
+            void webview.postMessage({ type: 'skillsLinked', seq: msg.seq, error: '无工作区，无法取消关联' })
+          }
+        } catch (e) { void webview.postMessage({ type: 'skillsLinked', seq: msg.seq, error: (e as Error).message }) }
+        break
+      }
     }
   }
 

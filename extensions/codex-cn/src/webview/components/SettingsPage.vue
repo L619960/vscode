@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 设置标签页：左导航 + 右内容。所有变更即时保存、真实生效。
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { vscodeApi } from '../main'
 
 interface NavItem { key: string; icon: string; label: string }
@@ -61,7 +61,7 @@ onMounted(() => {
 })
 
 // ---- 技能（真实 .md 文件）----
-interface SkillItem { name: string; title: string; preview: string }
+interface SkillItem { name: string; title: string; preview: string; linked?: boolean }
 const skills = ref<SkillItem[]>([])
 const editingName = ref('')
 const editingContent = ref('')
@@ -69,6 +69,95 @@ const skillDirty = ref(false)
 const skillError = ref('')
 const showCreate = ref(false)
 const newSkillName = ref('')
+
+// 批量管理
+const skillSearch = ref('')
+const skillFilter = ref<'all' | 'linked' | 'unlinked'>('all')
+const selectedSkills = ref<Set<string>>(new Set())
+const batchLoading = ref(false)
+
+/** 过滤后的技能列表 */
+const filteredSkills = computed(() => {
+  const q = skillSearch.value.toLowerCase().trim()
+  return skills.value.filter((s) => {
+    // 搜索过滤
+    if (q && !s.title.toLowerCase().includes(q) && !s.name.toLowerCase().includes(q) && !s.preview.toLowerCase().includes(q)) {
+      return false
+    }
+    // 关联状态过滤
+    if (skillFilter.value === 'linked' && !s.linked) return false
+    if (skillFilter.value === 'unlinked' && s.linked) return false
+    return true
+  })
+})
+
+/** 全选/取消全选 */
+const allSelected = computed(() => {
+  const filtered = filteredSkills.value
+  return filtered.length > 0 && filtered.every((s) => selectedSkills.value.has(s.name))
+})
+
+function toggleSelectAll(): void {
+  if (allSelected.value) {
+    selectedSkills.value.clear()
+  } else {
+    filteredSkills.value.forEach((s) => selectedSkills.value.add(s.name))
+  }
+}
+
+function toggleSelect(name: string): void {
+  if (selectedSkills.value.has(name)) {
+    selectedSkills.value.delete(name)
+  } else {
+    selectedSkills.value.add(name)
+  }
+}
+
+/** 批量关联 */
+async function batchLink(): Promise<void> {
+  const names = [...selectedSkills.value]
+  if (!names.length) return
+  batchLoading.value = true
+  skillError.value = ''
+  try {
+    await call('linkSkills', { names })
+    // 更新本地状态
+    skills.value.forEach((s) => {
+      if (names.includes(s.name)) s.linked = true
+    })
+    selectedSkills.value.clear()
+    flashSaved()
+  } catch (e) { skillError.value = String(e) }
+  batchLoading.value = false
+}
+
+/** 批量取消关联 */
+async function batchUnlink(): Promise<void> {
+  const names = [...selectedSkills.value]
+  if (!names.length) return
+  batchLoading.value = true
+  skillError.value = ''
+  try {
+    await call('unlinkSkills', { names })
+    // 更新本地状态
+    skills.value.forEach((s) => {
+      if (names.includes(s.name)) s.linked = false
+    })
+    selectedSkills.value.clear()
+    flashSaved()
+  } catch (e) { skillError.value = String(e) }
+  batchLoading.value = false
+}
+
+/** 单个技能切换关联状态 */
+async function toggleLink(item: SkillItem): Promise<void> {
+  const action = item.linked ? 'unlinkSkills' : 'linkSkills'
+  try {
+    await call(action, { names: [item.name] })
+    item.linked = !item.linked
+    flashSaved()
+  } catch (e) { skillError.value = String(e) }
+}
 
 async function loadSkills(): Promise<void> {
   try { skills.value = await call('listSkills') } catch (e) { skillError.value = String(e) }
@@ -325,18 +414,63 @@ function asNumber(e: Event): number { return Number((e.target as HTMLInputElemen
       <!-- 技能与命令 -->
       <section v-show="active === 'skills'" class="set-sec">
         <h2 class="sec-title">技能与命令</h2>
-        <p class="sec-sub">技能是保存在本机的提示词模板；在输入框键入「/」可快速插入</p>
-        <div class="skill-wrap">
-          <div class="skill-list">
-            <button type="button" class="skill-add" @click="showCreate = true">＋ 新建技能</button>
+        <p class="sec-sub">技能是保存在本机的提示词模板；Agent 仅加载已关联到当前项目的技能</p>
+
+        <!-- 批量管理工具栏 -->
+        <div class="skill-toolbar">
+          <div class="skill-search-row">
+            <input
+              v-model="skillSearch" class="skill-search" placeholder="搜索技能名称、内容..."
+              @keydown.esc="skillSearch = ''"
+            />
+            <select v-model="skillFilter" class="skill-filter">
+              <option value="all">全部</option>
+              <option value="linked">已关联</option>
+              <option value="unlinked">未关联</option>
+            </select>
+          </div>
+          <div class="skill-actions">
+            <label class="skill-select-all">
+              <input type="checkbox" :checked="allSelected" @change="toggleSelectAll" />
+              <span>全选（{{ filteredSkills.length }} 个）</span>
+            </label>
+            <span class="skill-count" v-if="selectedSkills.size > 0">
+              已选 {{ selectedSkills.size }} 个
+            </span>
             <button
-              v-for="item in skills" :key="item.name" type="button"
-              class="skill-item" :class="{ on: editingName === item.name }"
-              @click="openSkill(item)"
+              type="button" class="btn primary" :disabled="!selectedSkills.size || batchLoading"
+              @click="batchLink"
+            >关联</button>
+            <button
+              type="button" class="btn" :disabled="!selectedSkills.size || batchLoading"
+              @click="batchUnlink"
+            >取消关联</button>
+            <button type="button" class="btn" @click="showCreate = true">＋ 新建技能</button>
+          </div>
+        </div>
+
+        <!-- 技能列表：双栏布局 -->
+        <div class="skill-wrap">
+          <div class="skill-list skill-list-linkable">
+            <div
+              v-for="item in filteredSkills" :key="item.name"
+              class="skill-item" :class="{ on: editingName === item.name, linked: item.linked }"
             >
-              <div class="skill-name">{{ item.title }}</div>
-              <div class="skill-preview">{{ item.preview || '（空）' }}</div>
-            </button>
+              <input
+                type="checkbox" class="skill-check"
+                :checked="selectedSkills.has(item.name)"
+                @change="toggleSelect(item.name)"
+                @click.stop
+              />
+              <div class="skill-info" @click="openSkill(item)">
+                <div class="skill-name">
+                  {{ item.title }}
+                  <span v-if="item.linked" class="skill-badge">已关联</span>
+                </div>
+                <div class="skill-preview">{{ item.preview || '（空）' }}</div>
+              </div>
+            </div>
+            <div v-if="!filteredSkills.length" class="skill-empty">暂无匹配技能</div>
           </div>
           <div class="skill-editor">
             <template v-if="editingName">
@@ -349,7 +483,9 @@ function asNumber(e: Event): number { return Number((e.target as HTMLInputElemen
               <textarea v-model="editingContent" class="skill-text" spellcheck="false"
                 @input="markDirty()"></textarea>
             </template>
-            <div v-else class="skill-empty">从左侧选择一个技能，或新建技能</div>
+            <div v-else class="skill-empty">
+              从左侧选择一个技能编辑，<br/>或新建技能
+            </div>
           </div>
         </div>
         <div v-if="skillError" class="set-error">⚠️ {{ skillError }}</div>

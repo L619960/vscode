@@ -766,12 +766,95 @@ body {
 /* ---- 技能管理 ---- */
 .skill-wrap {
   display: flex; gap: 14px;
-  height: calc(100vh - 210px); min-height: 340px;
+  height: calc(100vh - 300px); min-height: 340px;
+}
+.skill-toolbar {
+  display: flex; flex-direction: column; gap: 8px;
+  margin-bottom: 10px;
+}
+.skill-search-row {
+  display: flex; gap: 8px;
+}
+.skill-search {
+  flex: 1;
+  background: rgba(120, 130, 150, 0.1);
+  border: 1px solid rgba(128, 140, 160, 0.3);
+  border-radius: 7px;
+  color: inherit;
+  padding: 7px 10px; font-size: 12.5px;
+}
+.skill-search:focus { outline: 1px solid #3a82f0; }
+.skill-filter {
+  background: rgba(120, 130, 150, 0.1);
+  border: 1px solid rgba(128, 140, 160, 0.3);
+  border-radius: 7px;
+  color: inherit;
+  padding: 7px 10px; font-size: 12.5px;
+  cursor: pointer;
+}
+.skill-actions {
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap;
+}
+.skill-select-all {
+  display: flex; align-items: center; gap: 4px;
+  cursor: pointer; font-size: 12px; opacity: 0.8;
+  user-select: none;
+}
+.skill-select-all input { cursor: pointer; }
+.skill-count {
+  font-size: 11px; opacity: 0.65;
+  padding: 2px 8px;
+  background: rgba(120, 130, 150, 0.12);
+  border-radius: 10px;
 }
 .skill-list {
-  flex: 0 0 230px;
+  flex: 0 0 260px;
   overflow-y: auto;
   display: flex; flex-direction: column; gap: 6px;
+}
+.skill-list-linkable .skill-item {
+  display: flex; align-items: flex-start; gap: 8px;
+  text-align: left;
+  border: 1px solid rgba(128, 140, 160, 0.15);
+  border-radius: 8px;
+  background: rgba(120, 130, 150, 0.07);
+  color: inherit;
+  padding: 9px 11px;
+  cursor: pointer;
+}
+.skill-list-linkable .skill-item:hover { background: rgba(120, 140, 170, 0.13); }
+.skill-list-linkable .skill-item.on {
+  border-color: rgba(58, 130, 240, 0.6);
+  background: rgba(60, 130, 240, 0.14);
+}
+.skill-list-linkable .skill-item.linked {
+  border-left: 3px solid #4caf50;
+}
+.skill-check {
+  margin-top: 2px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.skill-info {
+  flex: 1; min-width: 0;
+}
+.skill-name {
+  font-size: 12.5px; font-weight: 500;
+  display: flex; align-items: center; gap: 6px;
+}
+.skill-badge {
+  font-size: 10px; font-weight: 400;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: rgba(76, 175, 80, 0.2);
+  color: #81c784;
+  border: 1px solid rgba(76, 175, 80, 0.3);
+}
+.skill-preview {
+  font-size: 11px; opacity: 0.55;
+  margin-top: 3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .skill-add {
   border: 1px dashed rgba(128, 140, 160, 0.4);
@@ -782,26 +865,6 @@ body {
   cursor: pointer; opacity: 0.75;
 }
 .skill-add:hover { border-color: #3a82f0; color: #79aef5; opacity: 1; }
-.skill-item {
-  text-align: left;
-  border: 1px solid rgba(128, 140, 160, 0.15);
-  border-radius: 8px;
-  background: rgba(120, 130, 150, 0.07);
-  color: inherit;
-  padding: 9px 11px;
-  cursor: pointer;
-}
-.skill-item:hover { background: rgba(120, 140, 170, 0.13); }
-.skill-item.on {
-  border-color: rgba(58, 130, 240, 0.6);
-  background: rgba(60, 130, 240, 0.14);
-}
-.skill-name { font-size: 12.5px; font-weight: 500; }
-.skill-preview {
-  font-size: 11px; opacity: 0.55;
-  margin-top: 3px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
 
 .skill-editor {
   flex: 1; min-width: 0;

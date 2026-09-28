@@ -187,10 +187,20 @@ async function resolveAtReferences(text: string, workspaceRoot: string): Promise
 }
 
 /** 技能索引：只把名称+一句话预览注入系统提示，完整内容用 load_skill 按需加载（省每轮 token） */
-async function buildSkillIndex(skills?: SkillsStore): Promise<string> {
+/** 支持项目级过滤：仅列出与当前项目关联的技能，无关联时回退到全部技能（避免 Agent 无技能可用） */
+async function buildSkillIndex(skills?: SkillsStore, workspaceRoot?: string): Promise<string> {
   if (!skills) return ''
   try {
-    const list = await skills.list()
+    let list = await skills.list()
+    // 若在工作区内，尝试按项目关联过滤
+    if (workspaceRoot) {
+      const linked = await skills.getLinkedSkills(workspaceRoot)
+      // 有关联配置且存在已关联技能 → 只显示关联的
+      if (linked.length > 0) {
+        list = list.filter(s => linked.includes(s.name))
+      }
+      // linked 为空（未配置或全取消）→ 显示全部技能，避免 Agent 无技能可用
+    }
     if (!list.length) return ''
     return list.map(s => `- ${s.name.replace(/\.md$/, '')}：${(s.preview || '').split('\n')[0].slice(0, 60)}`).join('\n')
   } catch { return '' }
@@ -211,7 +221,7 @@ async function buildApiMessages(
   const folder = vscode.workspace.workspaceFolders?.[0]
   const wsName = folder?.name || '（无）'
   const dirSummary = await buildDirSummary()
-  const skillIndex = await buildSkillIndex(skills)
+  const skillIndex = await buildSkillIndex(skills, folder?.uri.fsPath)
   const taskType = resolvedText ? detectTaskType(resolvedText) : undefined
   const systemPrompt = await buildSystemPrompt(wsName, dirSummary, folder?.uri.fsPath, skillIndex, planMode, userMemory, taskType)
   const systemMsg: ChatMessage = { role: 'system', content: systemPrompt }
