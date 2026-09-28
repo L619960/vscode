@@ -231,6 +231,20 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'submit_plan',
+      description: '计划确认模式下提交实施方案。给出分步骤计划（做什么、改哪些文件、怎么验证），用户批准后才能执行写/命令类操作；用户提出修改意见时需修订后重新提交。',
+      parameters: {
+        type: 'object',
+        properties: {
+          plan: { type: 'string', description: '实施方案全文（分步骤，Markdown 格式）' },
+        },
+        required: ['plan'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'todo_write',
       description: '设置（全量替换）本次任务的规划清单，用于主动登记调研/设计/开发/验证等检查点。每次传入完整列表。',
       parameters: {
@@ -605,6 +619,7 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
       return args.action === 'start' ? String(args.command || '') : `${args.action} ${args.id || ''}`
     case 'todo_write': return `${(args.items as unknown[] || []).length} 项检查点`
     case 'load_skill': return String(args.name || '')
+    case 'submit_plan': return String(args.plan || '').split('\n')[0].slice(0, 60)
     case 'browser_navigate': return String(args.url || '')
     case 'browser_snapshot': return ''
     case 'browser_click': return `#${args.ref}`
@@ -663,6 +678,7 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
       return '完成'
     case 'todo_write': return `已登记 ${result.total ?? 0} 项（P0 ${result.p0 ?? 0}，完成 ${result.done ?? 0}）`
     case 'load_skill': return result.ok ? `已加载技能「${result.name}」` : `加载失败：${result.error || '未知'}`
+    case 'submit_plan': return result.ok ? '方案已获用户批准' : `方案未通过：${result.error || result.feedback || '用户要求修改'}`
     case 'browser_navigate': return `已打开 ${result.title || result.url}`
     case 'browser_snapshot': return `${(result.elements as unknown[])?.length ?? 0} 个可交互元素`
     case 'browser_click': return '已点击'

@@ -48,6 +48,7 @@ export function setConfig(patch: Partial<{
   model: string
   supportsTools: string
   autoApprove: boolean
+  planMode: boolean
   tabCompletion: boolean
   toolRead: boolean
   toolWrite: boolean
@@ -68,6 +69,7 @@ export function setConfig(patch: Partial<{
   if (patch.model !== undefined) strTargets.push(['model', patch.model])
   if (patch.supportsTools !== undefined) strTargets.push(['supportsTools', patch.supportsTools])
   if (patch.autoApprove !== undefined) boolTargets.push(['autoApprove', patch.autoApprove])
+  if (patch.planMode !== undefined) boolTargets.push(['planMode', patch.planMode])
   if (patch.tabCompletion !== undefined) boolTargets.push(['tabCompletion', patch.tabCompletion])
   if (patch.toolRead !== undefined) boolTargets.push(['toolRead', patch.toolRead])
   if (patch.toolWrite !== undefined) boolTargets.push(['toolWrite', patch.toolWrite])

@@ -145,6 +145,11 @@
           "default": false,
           "description": "自动审批：AI 写文件/编辑/运行命令不再询问（请谨慎开启）"
         },
+        "codex-cn.planMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "计划确认模式：AI 执行写文件/命令前必须先提交实施方案并获你批准（对标 Trae Plan 模式）"
+        },
         "codex-cn.tabCompletion": {
           "type": "boolean",
           "default": true,

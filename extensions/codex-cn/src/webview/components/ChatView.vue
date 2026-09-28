@@ -95,7 +95,7 @@ const TOOL_LABELS: Record<string, string> = {
   edit_file: '编辑文件', delete_file: '删除文件', run_command: '运行命令', search_files: '搜索文件',
   web_search: '联网搜索', glob: '匹配文件名', web_fetch: '抓取网页',
   read_lints: '读取诊断', await_shell: '后台进程', todo_write: '更新规划', ask_user: '向用户提问',
-  load_skill: '加载技能',
+  load_skill: '加载技能', submit_plan: '提交方案',
   browser_navigate: '浏览器打开', browser_snapshot: '页面快照', browser_click: '浏览器点击',
   browser_type: '浏览器输入', browser_press_key: '按键操作', browser_fill: '整体填值', browser_select_option: '下拉选择',
   browser_scroll: '浏览器滚动', browser_screenshot: '页面截图',
@@ -282,7 +282,8 @@ function attachApprovals(): void {
 function findAwaitingRun(toolName: string, argsSummary: string): ToolRun | undefined {
   for (let i = messages.value.length - 1; i >= 0; i--) {
     for (const t of messages.value[i].toolRuns || []) {
-      if (t.status === 'awaiting' && t.name === toolName && t.argsSummary === argsSummary) return t
+      // submit_plan 的审批 argsSummary 是方案全文，与 run 上截断的摘要不一致，按名称匹配即可（工具串行执行，同时只有一个 awaiting）
+      if (t.status === 'awaiting' && t.name === toolName && (toolName === 'submit_plan' || t.argsSummary === argsSummary)) return t
     }
   }
   return undefined

@@ -97,8 +97,8 @@ function activate(context: vscode.ExtensionContext): void {
   // 审批桥：请求推给 webview，等待按钮回调；开启自动审批或会话免审批时直接放行
   // 但危险命令（rm/del/shutdown 等）始终询问，防止误操作
   const requestApproval = (req: ApprovalRequest): Promise<ApprovalDecision> => {
-    if (req.toolName === 'ask_user') {
-      // 结构化提问永远等用户回答，不走自动审批
+    if (req.toolName === 'ask_user' || req.toolName === 'submit_plan') {
+      // 结构化提问/计划确认永远等用户回答，不走自动审批
     } else if (req.danger) {
       // 危险命令不自动放行，必须人工确认
     } else {
@@ -152,6 +152,7 @@ function activate(context: vscode.ExtensionContext): void {
       subAgents,
       taskBoard: board,
       skills,
+      planMode: vscode.workspace.getConfiguration('codex-cn').get<boolean>('planMode', false),
     }
     await runAgent(text, deps, cancelSource.token)
     cancelSource = null
@@ -214,7 +215,7 @@ function activate(context: vscode.ExtensionContext): void {
     const s = getAgentSettings()
     return {
       provider: c.get('provider'), baseUrl: c.get('baseUrl'), model: c.get('model'),
-      supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), tabCompletion: c.get('tabCompletion'), hasKey: !!key,
+      supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), planMode: c.get('planMode'), tabCompletion: c.get('tabCompletion'), hasKey: !!key,
       // 工具开关 / 隐私 / 对话流
       toolRead: s.toolRead, toolWrite: s.toolWrite, toolShell: s.toolShell,
       toolBrowser: s.toolBrowser, toolWeb: s.toolWeb, privacyMode: s.privacyMode,
@@ -226,7 +227,7 @@ function activate(context: vscode.ExtensionContext): void {
 
   type ConfigPatch = {
     provider?: string; baseUrl?: string; model?: string; supportsTools?: string
-    autoApprove?: boolean; tabCompletion?: boolean; apiKey?: string
+    autoApprove?: boolean; planMode?: boolean; tabCompletion?: boolean; apiKey?: string
     toolRead?: boolean; toolWrite?: boolean; toolShell?: boolean; toolBrowser?: boolean; toolWeb?: boolean
     privacyMode?: boolean; maxMessages?: number; autoTitle?: boolean; maxSessions?: number
   }
@@ -240,6 +241,7 @@ function activate(context: vscode.ExtensionContext): void {
     if (patch.model !== undefined) rest.model = patch.model
     if (patch.supportsTools !== undefined) rest.supportsTools = patch.supportsTools
     if (patch.autoApprove !== undefined) rest.autoApprove = patch.autoApprove
+    if (patch.planMode !== undefined) rest.planMode = patch.planMode
     if (patch.tabCompletion !== undefined) rest.tabCompletion = patch.tabCompletion
     if (patch.toolRead !== undefined) rest.toolRead = patch.toolRead
     if (patch.toolWrite !== undefined) rest.toolWrite = patch.toolWrite

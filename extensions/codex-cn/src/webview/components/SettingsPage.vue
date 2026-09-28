@@ -204,6 +204,14 @@ function asNumber(e: Event): number { return Number((e.target as HTMLInputElemen
             <input type="checkbox" class="tg" :checked="!!cfg.autoApprove"
               @change="patch({ autoApprove: asChecked($event) })" />
           </div>
+          <div class="row">
+            <div class="row-txt">
+              <div class="row-name">计划确认模式</div>
+              <div class="row-desc">AI 动手前先提交实施方案，获你批准后才执行写/命令类操作（对标 Trae Plan 模式）</div>
+            </div>
+            <input type="checkbox" class="tg" :checked="!!cfg.planMode"
+              @change="patch({ planMode: asChecked($event) })" />
+          </div>
           <div class="set-note">⚠️ <strong>rm -rf、del /s、format、shutdown</strong> 等危险命令始终需要人工确认，自动审批不覆盖危险操作</div>
         </div>
       </section>

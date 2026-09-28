@@ -67,6 +67,8 @@ export interface AgentDeps {
   subAgents?: SubAgentManager
   taskBoard?: TaskBoard
   skills?: SkillsStore
+  /** 计划确认模式：开启后写/执行类工具必须先经 submit_plan 获用户批准 */
+  planMode?: boolean
 }
 
 /** 2 层目录摘要 */
@@ -188,12 +190,12 @@ async function buildSkillIndex(skills?: SkillsStore): Promise<string> {
 }
 
 /** 历史 toolRuns 重建为 API wire 消息，超出字符阈值时压缩早期记录 */
-async function buildApiMessages(session: Session, skills?: SkillsStore): Promise<ChatMessage[]> {
+async function buildApiMessages(session: Session, skills?: SkillsStore, planMode?: boolean): Promise<ChatMessage[]> {
   const folder = vscode.workspace.workspaceFolders?.[0]
   const wsName = folder?.name || '（无）'
   const dirSummary = await buildDirSummary()
   const skillIndex = await buildSkillIndex(skills)
-  const systemPrompt = await buildSystemPrompt(wsName, dirSummary, folder?.uri.fsPath, skillIndex)
+  const systemPrompt = await buildSystemPrompt(wsName, dirSummary, folder?.uri.fsPath, skillIndex, planMode)
   const systemMsg: ChatMessage = { role: 'system', content: systemPrompt }
 
   const all: ChatMessage[] = []
@@ -338,7 +340,7 @@ function withFileNotFoundHint(result: Record<string, unknown>): Record<string, u
 export async function runAgent(userText: string, deps: AgentDeps, token: vscode.CancellationToken): Promise<void> {
   const apiKey = await deps.getApiKey()
   const llmConfig = getLLMConfig(apiKey)
-  let messages = await buildApiMessages(deps.session, deps.skills)
+  let messages = await buildApiMessages(deps.session, deps.skills, deps.planMode)
   const folder = vscode.workspace.workspaceFolders?.[0]
   const resolvedText = folder ? await resolveAtReferences(userText, folder.uri.fsPath) : userText
   messages.push({ role: 'user', content: resolvedText })
@@ -361,6 +363,8 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
   let lastModifyRound = 0   // 最近一次写类工具成功所在轮
   let verifyReminded = false // 验证提醒只发一次，防止死循环
   const loadedSkills = new Set<string>() // 本任务已加载的技能，避免重复加载占上下文
+  // 计划确认模式：写/执行类工具必须先 submit_plan 并获用户批准
+  let planApproved = !deps.planMode
   try {
     let consecutiveErrors = 0
     let consecutiveEmpty = 0
@@ -578,6 +582,18 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           continue
         }
 
+        // ★计划闸门：计划确认模式下，写/执行类工具必须先 submit_plan 并获用户批准
+        if (!planApproved && (WRITE_TOOLS.has(tname) || tname === 'run_command' || tname === 'await_shell') && !isBgManage && tname !== 'submit_plan') {
+          const gateMsg = '计划闸门：当前处于计划确认模式，执行写文件/命令前必须先调用 submit_plan 提交实施方案并获用户批准'
+          run.status = 'error'
+          run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: '立即调用 submit_plan（参数 plan 为分步实施方案），等用户批准后再执行' })
+          run.resultSummary = '计划闸门：需先提交方案'
+          deps.session.save()
+          deps.onChange()
+          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+          continue
+        }
+
         // ★检查点催办：每 5 轮检查一次，有 running 状态超过 10 轮的检查点时提醒更新
         if (round % 5 === 0 && round > 0 && deps.taskBoard) {
           const pending = deps.taskBoard.items.filter((i: TaskCheckpoint) => i.status === 'running')
@@ -587,6 +603,41 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
             messages.push({ role: 'user', content: reminder })
             // 不中断当前工具执行，仅追加提醒
           }
+        }
+
+        // ★计划确认：submit_plan 由 runAgent 特殊处理（复用审批通道，方案全文作为问题展示）
+        if (tname === 'submit_plan') {
+          const plan = String(args.plan || '').trim()
+          if (!plan) {
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: 'submit_plan 缺少 plan 参数' })
+            run.resultSummary = '缺少方案内容'
+          } else {
+            hooks.setStatus('awaiting')
+            const apr = await deps.requestApproval({
+              toolName: 'submit_plan', argsSummary: plan, kind: 'ask',
+              options: ['批准执行', '取消任务'],
+            })
+            if (apr.decision === 'allow' && (apr.reason === '批准执行' || !apr.reason)) {
+              planApproved = true
+              run.status = 'done'
+              run.resultJson = JSON.stringify({ ok: true, note: '方案已获用户批准，现在可以开始执行写/命令类操作' })
+              run.resultSummary = '方案已获用户批准'
+            } else if (apr.decision === 'allow') {
+              // 用户选择了自定义输入（修改意见），不批准但把意见反馈给模型修订
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, feedback: apr.reason, recovery: '用户对方案有修改意见（见 feedback），请修订方案后重新调用 submit_plan' })
+              run.resultSummary = '用户要求修改方案'
+            } else {
+              run.status = 'rejected'
+              run.resultJson = JSON.stringify({ ok: false, error: `用户取消了任务（${apr.reason || '未说明'}）` })
+              run.resultSummary = '用户取消任务'
+            }
+          }
+          deps.session.save()
+          deps.onChange()
+          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+          continue
         }
 
         // ★技能加载：load_skill 由 runAgent 特殊处理（直接读 SkillsStore，内容作为工具结果进入上下文）
@@ -685,8 +736,12 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         // 追踪修改与验证，供收尾前的验证闸门判断
         if (toolResult.ok) {
           if (tname === 'write_file' || tname === 'edit_file' || tname === 'delete_file' || tname === 'edit_notebook') {
-            modifiedPaths.add(normPath(args.path))
-            lastModifyRound = round
+            const np = normPath(args.path)
+            // .agent/memory.md 是记忆沉淀，不算代码修改，不触发验证闸门
+            if (!np.endsWith('.agent\\memory.md')) {
+              modifiedPaths.add(np)
+              lastModifyRound = round
+            }
           } else if (tname === 'run_command' || tname === 'read_lints' || tname === 'await_shell') {
             lastVerifyRound = round
           }

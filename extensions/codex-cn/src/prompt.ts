@@ -21,7 +21,7 @@ export async function loadProjectRules(workspaceRoot: string): Promise<{ rules: 
   return { rules: '', source: '' }
 }
 
-export async function buildSystemPrompt(workspaceName: string, dirSummary: string, workspaceRoot?: string, skillIndex?: string): Promise<string> {
+export async function buildSystemPrompt(workspaceName: string, dirSummary: string, workspaceRoot?: string, skillIndex?: string, planMode?: boolean): Promise<string> {
   let systemPrompt = `你是 Codex CN，一个 AI 编程助手，运行在用户的 Windows 桌面上（VS Code 内核）。
 
 ## 环境（固定事实，不要质疑）
@@ -95,6 +95,27 @@ ${dirSummary || '（尚未加载，先用 list_dir 探索）'}
   // 技能索引：只列名称与一句话预览，完整内容由模型用 load_skill 按需加载
   if (skillIndex) {
     systemPrompt += `\n\n## 可用技能（索引；任务命中场景时调用 load_skill 加载完整内容，禁止凭名称臆测内容）\n${skillIndex}`
+  }
+
+  // 项目记忆：.agent/memory.md 沉淀的跨会话约定与决策，启动时注入
+  if (workspaceRoot) {
+    try {
+      const memUri = vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), '.agent', 'memory.md')
+      const raw = Buffer.from(await vscode.workspace.fs.readFile(memUri)).toString('utf-8').trim()
+      if (raw) {
+        systemPrompt += `\n\n## 项目记忆（.agent/memory.md 中沉淀的历史约定与决策，必须遵守；发现新的可复用约定时，任务收尾前用 edit_file 追加到该文件）\n${raw.slice(0, 2000)}`
+      }
+    } catch { /* 文件不存在时跳过 */ }
+  }
+
+  // 计划确认模式：写/执行前必须先 submit_plan 获用户批准
+  if (planMode) {
+    systemPrompt += `\n\n## ★计划确认模式（当前已开启，最高优先级约束）
+- 你处于计划确认模式：在执行任何 write_file / edit_file / delete_file / edit_notebook / run_command / await_shell(start) 之前，必须先调用 submit_plan 提交完整实施方案
+- 方案内容：分步骤说明做什么、改哪些文件、每步如何验证（Markdown 格式）
+- 只读探索工具（list_dir / read_file / search_files / glob / read_lints / web_*）不受限，应先探索清楚再提交方案
+- 用户批准前，系统会拦截一切写/执行操作；获批准后正常执行
+- 若用户提出修改意见，修订方案后重新调用 submit_plan，直到获批为止`
   }
 
   return systemPrompt
