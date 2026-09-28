@@ -217,6 +217,20 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'load_skill',
+      description: '按需加载技能（领域知识/流程手册）的完整内容。系统提示中列出了可用技能索引，任务命中某技能场景时调用一次即可，内容会进入本轮上下文。',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '技能名（索引中列出的名称，.md 后缀可省略）' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'todo_write',
       description: '设置（全量替换）本次任务的规划清单，用于主动登记调研/设计/开发/验证等检查点。每次传入完整列表。',
       parameters: {
@@ -558,6 +572,14 @@ export const PLAN_TOOLS = new Set(['todo_write'])
 /** 子代理工具（spawn/await，由 runAgent 特殊处理） */
 export const TASK_TOOLS = new Set(['spawn_task', 'await_task'])
 
+// ---- 工具 schema 分组：浏览器工具体量大，默认不下发，任务涉及网页时才附带（省每轮 prefill token） ----
+export const CORE_TOOL_SCHEMAS = TOOL_SCHEMAS.filter(t => !BROWSER_TOOLS.has(t.function.name))
+export const BROWSER_TOOL_SCHEMAS = TOOL_SCHEMAS.filter(t => BROWSER_TOOLS.has(t.function.name))
+/** 任务文本需要浏览器工具的判定：含 URL 或网页/浏览器相关关键词 */
+export function wantsBrowser(text: string): boolean {
+  return /https?:\/\//i.test(text) || /网页|浏览器|网站|网址|截图|抓取|爬虫|点击页面|browser/i.test(text)
+}
+
 export function summarizeArgs(name: string, args: Record<string, unknown>): string {
   if (!args || typeof args !== 'object') return ''
   switch (name) {
@@ -582,6 +604,7 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
     case 'await_shell':
       return args.action === 'start' ? String(args.command || '') : `${args.action} ${args.id || ''}`
     case 'todo_write': return `${(args.items as unknown[] || []).length} 项检查点`
+    case 'load_skill': return String(args.name || '')
     case 'browser_navigate': return String(args.url || '')
     case 'browser_snapshot': return ''
     case 'browser_click': return `#${args.ref}`
@@ -639,6 +662,7 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
       if (result.action === 'stop') return '已停止'
       return '完成'
     case 'todo_write': return `已登记 ${result.total ?? 0} 项（P0 ${result.p0 ?? 0}，完成 ${result.done ?? 0}）`
+    case 'load_skill': return result.ok ? `已加载技能「${result.name}」` : `加载失败：${result.error || '未知'}`
     case 'browser_navigate': return `已打开 ${result.title || result.url}`
     case 'browser_snapshot': return `${(result.elements as unknown[])?.length ?? 0} 个可交互元素`
     case 'browser_click': return '已点击'

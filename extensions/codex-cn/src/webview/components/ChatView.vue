@@ -95,6 +95,7 @@ const TOOL_LABELS: Record<string, string> = {
   edit_file: '编辑文件', delete_file: '删除文件', run_command: '运行命令', search_files: '搜索文件',
   web_search: '联网搜索', glob: '匹配文件名', web_fetch: '抓取网页',
   read_lints: '读取诊断', await_shell: '后台进程', todo_write: '更新规划', ask_user: '向用户提问',
+  load_skill: '加载技能',
   browser_navigate: '浏览器打开', browser_snapshot: '页面快照', browser_click: '浏览器点击',
   browser_type: '浏览器输入', browser_press_key: '按键操作', browser_fill: '整体填值', browser_select_option: '下拉选择',
   browser_scroll: '浏览器滚动', browser_screenshot: '页面截图',

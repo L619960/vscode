@@ -3,12 +3,13 @@
 import * as vscode from 'vscode'
 import { chatCompletion } from './llm.js'
 import { getLLMConfig } from './config.js'
-import { TOOL_SCHEMAS, WRITE_TOOLS, summarizeArgs, summarizeResult } from './tools.js'
+import { TOOL_SCHEMAS, CORE_TOOL_SCHEMAS, WRITE_TOOLS, READ_TOOLS, summarizeArgs, summarizeResult, wantsBrowser } from './tools.js'
 import { executeToolCall, type ApprovalDecision, type ApprovalRequest, type ExecHooks, type ToolDeps } from './executor.js'
 import { SubAgentManager } from './subAgent.js'
 import { buildSystemPrompt } from './prompt.js'
 import { Session, type SessionMessage, type ToolRun } from './session.js'
 import type { TaskBoard, TaskCheckpoint } from './taskBoard.js'
+import type { SkillsStore } from './skills.js'
 import type { ChatMessage, ToolCall } from './types.js'
 
 const MAX_ROUNDS = 200
@@ -65,6 +66,7 @@ export interface AgentDeps {
   toolDeps: ToolDeps
   subAgents?: SubAgentManager
   taskBoard?: TaskBoard
+  skills?: SkillsStore
 }
 
 /** 2 层目录摘要 */
@@ -175,12 +177,23 @@ async function resolveAtReferences(text: string, workspaceRoot: string): Promise
   return blocks.join('\n\n') + '\n\n' + text
 }
 
+/** 技能索引：只把名称+一句话预览注入系统提示，完整内容用 load_skill 按需加载（省每轮 token） */
+async function buildSkillIndex(skills?: SkillsStore): Promise<string> {
+  if (!skills) return ''
+  try {
+    const list = await skills.list()
+    if (!list.length) return ''
+    return list.map(s => `- ${s.name.replace(/\.md$/, '')}：${(s.preview || '').split('\n')[0].slice(0, 60)}`).join('\n')
+  } catch { return '' }
+}
+
 /** 历史 toolRuns 重建为 API wire 消息，超出字符阈值时压缩早期记录 */
-async function buildApiMessages(session: Session): Promise<ChatMessage[]> {
+async function buildApiMessages(session: Session, skills?: SkillsStore): Promise<ChatMessage[]> {
   const folder = vscode.workspace.workspaceFolders?.[0]
   const wsName = folder?.name || '（无）'
   const dirSummary = await buildDirSummary()
-  const systemPrompt = await buildSystemPrompt(wsName, dirSummary, folder?.uri.fsPath)
+  const skillIndex = await buildSkillIndex(skills)
+  const systemPrompt = await buildSystemPrompt(wsName, dirSummary, folder?.uri.fsPath, skillIndex)
   const systemMsg: ChatMessage = { role: 'system', content: systemPrompt }
 
   const all: ChatMessage[] = []
@@ -325,7 +338,7 @@ function withFileNotFoundHint(result: Record<string, unknown>): Record<string, u
 export async function runAgent(userText: string, deps: AgentDeps, token: vscode.CancellationToken): Promise<void> {
   const apiKey = await deps.getApiKey()
   const llmConfig = getLLMConfig(apiKey)
-  let messages = await buildApiMessages(deps.session)
+  let messages = await buildApiMessages(deps.session, deps.skills)
   const folder = vscode.workspace.workspaceFolders?.[0]
   const resolvedText = folder ? await resolveAtReferences(userText, folder.uri.fsPath) : userText
   messages.push({ role: 'user', content: resolvedText })
@@ -347,6 +360,7 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
   let lastVerifyRound = 0   // 最近一次验证类工具（run_command / read_lints / await_shell）成功所在轮
   let lastModifyRound = 0   // 最近一次写类工具成功所在轮
   let verifyReminded = false // 验证提醒只发一次，防止死循环
+  const loadedSkills = new Set<string>() // 本任务已加载的技能，避免重复加载占上下文
   try {
     let consecutiveErrors = 0
     let consecutiveEmpty = 0
@@ -364,7 +378,8 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
 
       const result = await chatCompletion({
         messages,
-        tools: TOOL_SCHEMAS,
+        // 浏览器 schema 体量大：仅在任务涉及网页时附带，日常任务每轮省数千 token 的 prefill
+        tools: wantsBrowser(resolvedText) ? TOOL_SCHEMAS : CORE_TOOL_SCHEMAS,
         config: llmConfig,
         signal: abort.signal,
         onToken: (t) => {
@@ -447,8 +462,56 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
       }
       consecutiveEmpty = 0
 
-      for (const call of result.toolCalls) {
+      for (let ci = 0; ci < result.toolCalls.length; ci++) {
+        const call = result.toolCalls[ci]
         if (token.isCancellationRequested || abort.signal.aborted) { deps.session.save(); return }
+
+        // ★只读并行批：连续多个只读工具（read_file/search_files/glob/web_* 等）无依赖，并行执行省多轮等待
+        if (READ_TOOLS.has(call.function.name)) {
+          const batch: ToolCall[] = [call]
+          while (ci + 1 < result.toolCalls.length && READ_TOOLS.has(result.toolCalls[ci + 1].function.name)) {
+            batch.push(result.toolCalls[++ci])
+          }
+          if (batch.length > 1) {
+            const runs = batch.map(c => {
+              const r: ToolRun = {
+                id: c.id, name: c.function.name, argsSummary: '', argsJson: c.function.arguments,
+                status: 'running', resultJson: '', resultSummary: '',
+              }
+              try { r.argsSummary = summarizeArgs(c.function.name, JSON.parse(c.function.arguments || '{}')) }
+              catch { r.argsSummary = '⚠ 参数格式错误' }
+              assistantMsg.toolRuns!.push(r)
+              return r
+            })
+            deps.onChange()
+            await Promise.all(batch.map(async (c, k) => {
+              const r = runs[k]
+              const hooks: ExecHooks = {
+                setStatus: (s) => { r.status = s as ToolRun['status']; deps.onChange() },
+                requestApproval: (req) => deps.requestApproval(req),
+              }
+              try {
+                const raw = await executeToolWithTimeout(c, hooks, deps.toolDeps)
+                const tr = truncateToolResult(r.name, withFileNotFoundHint(raw))
+                r.status = tr.ok ? 'done' : 'error'
+                r.resultJson = JSON.stringify(tr)
+                r.resultSummary = summarizeResult(r.name, tr)
+                // read_lints 属验证类：并行批里也要更新验证轮次，供验证闸门判断
+                if (tr.ok && r.name === 'read_lints') lastVerifyRound = round
+              } catch (e) {
+                r.status = 'error'
+                r.resultJson = JSON.stringify({ ok: false, error: (e as Error).message })
+                r.resultSummary = '执行异常'
+              }
+            }))
+            for (const r of runs) {
+              messages.push({ role: 'tool', tool_call_id: r.id, content: r.resultJson })
+            }
+            deps.session.save()
+            deps.onChange()
+            continue
+          }
+        }
 
         let args: Record<string, unknown> = {}
         let argsParseError = ''
@@ -524,6 +587,37 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
             messages.push({ role: 'user', content: reminder })
             // 不中断当前工具执行，仅追加提醒
           }
+        }
+
+        // ★技能加载：load_skill 由 runAgent 特殊处理（直接读 SkillsStore，内容作为工具结果进入上下文）
+        if (tname === 'load_skill') {
+          const rawName = String(args.name || '').trim()
+          const fileName = rawName.endsWith('.md') ? rawName : `${rawName}.md`
+          if (!deps.skills) {
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: '技能库未初始化' })
+            run.resultSummary = '技能库不可用'
+          } else if (loadedSkills.has(fileName)) {
+            run.status = 'done'
+            run.resultJson = JSON.stringify({ ok: true, name: rawName, note: '该技能已加载过，完整内容见上文工具结果，请勿重复加载' })
+            run.resultSummary = `技能「${rawName}」已加载过`
+          } else {
+            try {
+              const content = await deps.skills.read(fileName)
+              loadedSkills.add(fileName)
+              run.status = 'done'
+              run.resultJson = JSON.stringify({ ok: true, name: rawName, content })
+              run.resultSummary = `已加载技能「${rawName}」`
+            } catch (e) {
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, error: `技能不存在或不可读: ${fileName}（${(e as Error).message}）`, recovery: '从系统提示的技能索引中选择存在的名称重试' })
+              run.resultSummary = '技能不存在'
+            }
+          }
+          deps.session.save()
+          deps.onChange()
+          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+          continue
         }
 
         // ★子代理工具：spawn_task / await_task 由 runAgent 特殊处理（不走 executeToolCall）

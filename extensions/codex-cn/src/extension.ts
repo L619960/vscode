@@ -151,6 +151,7 @@ function activate(context: vscode.ExtensionContext): void {
       toolDeps: { board, bgShell, browser },
       subAgents,
       taskBoard: board,
+      skills,
     }
     await runAgent(text, deps, cancelSource.token)
     cancelSource = null
