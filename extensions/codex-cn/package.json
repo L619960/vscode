@@ -158,7 +158,7 @@
         "codex-cn.mcpServers": {
           "type": "object",
           "default": {},
-          "description": "MCP 工具服务器配置（stdio 传输）。示例：{\"filesystem\": {\"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"D:/\"]}}"
+          "description": "MCP 工具服务器配置，支持 stdio 与 http 两种传输。stdio 示例：{\"fs\": {\"type\": \"stdio\", \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"D:/\"]}}；http 示例：{\"remote\": {\"type\": \"http\", \"url\": \"http://127.0.0.1:3000/mcp\"}}"
         },
         "codex-cn.tabCompletion": {
           "type": "boolean",

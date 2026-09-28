@@ -9,6 +9,7 @@ const NAV: NavItem[] = [
   { key: 'approval', icon: '🛡️', label: '权限审批' },
   { key: 'general', icon: '⚙️', label: '通用' },
   { key: 'tools', icon: '🧰', label: '工具开关' },
+  { key: 'mcp', icon: '🔌', label: 'MCP 工具' },
   { key: 'privacy', icon: '🔒', label: '隐私模式' },
   { key: 'session', icon: '💬', label: '对话流' },
   { key: 'skills', icon: '✨', label: '技能与命令' },
@@ -72,6 +73,92 @@ function pickModel(id: string): void {
   showModelsPop.value = false
 }
 
+// ---- MCP 服务器（外部工具，热增删/重连）----
+interface McpServer {
+  name: string
+  status: 'connecting' | 'connected' | 'error'
+  error: string
+  toolCount: number
+  tools: Array<{ name: string; description: string }>
+  config: {
+    type?: 'stdio' | 'http'
+    command?: string
+    args?: string[]
+    env?: Record<string, string>
+    url?: string
+  }
+}
+const mcpServers = ref<McpServer[]>([])
+const mcpError = ref('')
+const mcpLoading = ref(false)
+const showMcpForm = ref(false)
+const mcpForm = ref({
+  name: '',
+  type: 'stdio' as 'stdio' | 'http',
+  command: '',
+  argsText: '',
+  url: '',
+})
+
+/** 已连接服务器数量 */
+const mcpConnected = computed(() => mcpServers.value.filter(s => s.status === 'connected').length)
+
+/** 状态中文文案 */
+function statusText(status: McpServer['status']): string {
+  return status === 'connected' ? '已连接' : status === 'connecting' ? '连接中' : '连接失败'
+}
+
+async function loadMcp(): Promise<void> {
+  try { mcpServers.value = await call('mcpList') } catch (e) { mcpError.value = String(e) }
+}
+
+/** 打开新增表单 */
+function openMcpCreate(): void {
+  mcpForm.value = { name: '', type: 'stdio', command: '', argsText: '', url: '' }
+  mcpError.value = ''
+  showMcpForm.value = true
+}
+
+/** 打开编辑表单，回填现有配置 */
+function openMcpEdit(s: McpServer): void {
+  mcpForm.value = {
+    name: s.name,
+    type: s.config.type === 'http' ? 'http' : 'stdio',
+    command: s.config.command ?? '',
+    argsText: (s.config.args ?? []).join(' '),
+    url: s.config.url ?? '',
+  }
+  mcpError.value = ''
+  showMcpForm.value = true
+}
+
+/** 保存并连接（后端持久化 + 热重连） */
+async function saveMcp(): Promise<void> {
+  const f = mcpForm.value
+  const name = f.name.trim()
+  if (!name) { mcpError.value = '请填写服务器名称'; return }
+  const config = f.type === 'http'
+    ? { type: 'http', url: f.url.trim() }
+    : { type: 'stdio', command: f.command.trim(), args: f.argsText.split(/\s+/).filter(Boolean) }
+  mcpLoading.value = true
+  mcpError.value = ''
+  try {
+    await call('mcpUpsert', { name, config })
+    showMcpForm.value = false
+  } catch (e) { mcpError.value = String(e) }
+  mcpLoading.value = false
+}
+
+async function removeMcp(s: McpServer): Promise<void> {
+  mcpError.value = ''
+  try { await call('mcpRemove', { name: s.name }) } catch (e) { mcpError.value = String(e) }
+}
+
+async function reconnectMcp(s: McpServer): Promise<void> {
+  mcpError.value = ''
+  try { await call('mcpReconnect', { name: s.name }) } catch (e) { mcpError.value = String(e) }
+}
+
 onMounted(() => {
   window.addEventListener('message', (e: MessageEvent) => {
     const m = e.data
@@ -85,6 +172,14 @@ onMounted(() => {
       void call('getConfig').then((d) => { cfg.value = d }).catch(() => undefined)
       return
     }
+    if (m.type === 'mcpSaved') {
+      // 保存已落盘：结算调用，全量刷新服务器卡片；连接错误显示在卡片与提示条上
+      const wMcp = m.seq ? waiters.get(m.seq) : undefined
+      if (wMcp) { waiters.delete(m.seq); wMcp.resolve(true) }
+      mcpServers.value = m.servers || []
+      mcpError.value = m.error || ''
+      return
+    }
     const w = m.seq ? waiters.get(m.seq) : undefined
     if (!w) return
     waiters.delete(m.seq)
@@ -92,10 +187,12 @@ onMounted(() => {
     else if (m.type === 'skills') w.resolve(m.items || [])
     else if (m.type === 'skillContent') w.resolve(m.content || '')
     else if (m.type === 'modelsList') w.resolve(m.models || [])
+    else if (m.type === 'mcpList') w.resolve(m.servers || [])
     else w.resolve(true)
   })
   void call('getConfig').catch(() => undefined)
   void loadSkills()
+  void loadMcp()
 })
 
 // ---- 技能（真实 .md 文件）----
@@ -428,6 +525,77 @@ function asNumber(e: Event): number { return Number((e.target as HTMLInputElemen
               @change="patch({ toolWeb: asChecked($event) })" />
           </div>
         </div>
+      </section>
+
+      <!-- MCP 工具 -->
+      <section v-show="active === 'mcp'" class="set-sec">
+        <h2 class="sec-title">MCP 工具</h2>
+        <p class="sec-sub">接入外部工具服务器（Model Context Protocol），Agent 可自动发现并调用其工具；保存后立即生效</p>
+
+        <div class="mcp-toolbar">
+          <button type="button" class="btn primary" @click="openMcpCreate">＋ 添加服务器</button>
+          <span class="mcp-total" v-if="mcpServers.length">
+            共 {{ mcpServers.length }} 个 · {{ mcpConnected }} 个已连接
+          </span>
+        </div>
+
+        <div class="mcp-list">
+          <div v-for="s in mcpServers" :key="s.name" class="mcp-card">
+            <div class="mcp-head">
+              <span class="mcp-name">{{ s.name }}</span>
+              <span class="mcp-state" :class="s.status">
+                <i class="dot"></i>{{ statusText(s.status) }}
+              </span>
+            </div>
+            <div class="mcp-cfg">
+              <template v-if="(s.config.type || 'stdio') === 'http'">{{ s.config.url }}</template>
+              <template v-else>
+                {{ s.config.command }}<span v-if="s.config.args && s.config.args.length"> {{ s.config.args.join(' ') }}</span>
+              </template>
+            </div>
+            <div v-if="s.status === 'error'" class="mcp-err">⚠️ {{ s.error }}</div>
+            <div v-if="s.tools.length" class="mcp-tools">
+              <span v-for="t in s.tools" :key="t.name" class="mcp-tool-tag" :title="t.description">{{ t.name }}</span>
+            </div>
+            <div class="mcp-actions">
+              <button type="button" class="btn" @click="reconnectMcp(s)">重连</button>
+              <button type="button" class="btn" @click="openMcpEdit(s)">编辑</button>
+              <button type="button" class="btn danger" @click="removeMcp(s)">移除</button>
+            </div>
+          </div>
+          <div v-if="!mcpServers.length" class="mcp-empty">尚未添加 MCP 服务器，点击「添加服务器」接入</div>
+        </div>
+        <div v-if="mcpError" class="set-error">⚠️ {{ mcpError }}</div>
+
+        <van-popup v-model:show="showMcpForm" position="bottom" round teleport="body">
+          <div class="mcp-form">
+            <div class="create-title">{{ mcpForm.name ? '编辑 MCP 服务器' : '添加 MCP 服务器' }}</div>
+            <label class="mcp-label">服务器名称</label>
+            <input v-model="mcpForm.name" class="create-input" placeholder="如 everything" spellcheck="false" />
+            <label class="mcp-label">传输方式</label>
+            <select v-model="mcpForm.type" class="mcp-select">
+              <option value="stdio">stdio（本地进程）</option>
+              <option value="http">HTTP（远程服务）</option>
+            </select>
+            <template v-if="mcpForm.type === 'stdio'">
+              <label class="mcp-label">启动命令</label>
+              <input v-model="mcpForm.command" class="create-input" placeholder="如 npx" spellcheck="false" />
+              <label class="mcp-label">参数（空格分隔；路径含空格请改用 settings.json 配置）</label>
+              <input v-model="mcpForm.argsText" class="create-input"
+                placeholder="-y @modelcontextprotocol/server-everything" spellcheck="false" />
+            </template>
+            <template v-else>
+              <label class="mcp-label">服务 URL</label>
+              <input v-model="mcpForm.url" class="create-input" placeholder="http://127.0.0.1:3000/mcp" spellcheck="false" />
+            </template>
+            <div class="create-actions">
+              <button type="button" class="btn" @click="showMcpForm = false">取消</button>
+              <button type="button" class="btn primary" :disabled="mcpLoading" @click="saveMcp">
+                {{ mcpLoading ? '连接中…' : '保存并连接' }}
+              </button>
+            </div>
+          </div>
+        </van-popup>
       </section>
 
       <!-- 隐私模式 -->

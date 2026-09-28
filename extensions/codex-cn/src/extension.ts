@@ -343,6 +343,16 @@ function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  // MCP 配置持久化：读出现有 mcpServers → 变更 → 写回用户设置（全局）
+  const persistMcpServers = async (
+    mut: (servers: Record<string, McpServerConfig>) => void,
+  ): Promise<void> => {
+    const cfg = vscode.workspace.getConfiguration('codex-cn')
+    const servers = { ...cfg.get<Record<string, McpServerConfig>>('mcpServers', {}) }
+    mut(servers)
+    await cfg.update('mcpServers', servers, vscode.ConfigurationTarget.Global)
+  }
+
   // ---- Webview 消息统一处理：侧栏视图与编辑器标签页共用 ----
   const handleMessage = async (webview: vscode.Webview, msg: any): Promise<void> => {
     switch (msg.type) {
@@ -531,6 +541,52 @@ function activate(context: vscode.ExtensionContext): void {
             void webview.postMessage({ type: 'skillsLinked', seq: msg.seq, error: '无工作区，无法取消关联' })
           }
         } catch (e) { void webview.postMessage({ type: 'skillsLinked', seq: msg.seq, error: (e as Error).message }) }
+        break
+      }
+      // ---- MCP 服务器管理：列表 / 新增更新 / 移除 / 重连（热生效，立即写入用户设置） ----
+      case 'mcpList':
+        void webview.postMessage({ type: 'mcpList', seq: msg.seq, servers: mcp.list() })
+        break
+      case 'mcpUpsert': {
+        const name = String(msg.name || '').trim()
+        const cfg0 = (msg.config ?? {}) as McpServerConfig
+        try {
+          if (!name) throw new Error('服务器名称不能为空')
+          // 归一化：按传输类型清掉无关字段，args 空串过滤
+          const isHttp = (cfg0.type ?? (cfg0.url && !cfg0.command ? 'http' : 'stdio')) === 'http'
+          const cfg: McpServerConfig = isHttp
+            ? { type: 'http', url: String(cfg0.url || '').trim() }
+            : {
+              type: 'stdio',
+              command: String(cfg0.command || '').trim(),
+              args: (cfg0.args ?? []).map(a => String(a)).filter(a => a.length > 0),
+              env: cfg0.env && Object.keys(cfg0.env).length ? cfg0.env : undefined,
+            }
+          if (isHttp && !cfg.url) throw new Error('HTTP 服务器必须填写 URL')
+          if (!isHttp && !cfg.command) throw new Error('stdio 服务器必须填写命令')
+          await persistMcpServers(servers => { servers[name] = cfg })
+          const err = await mcp.upsert(name, cfg)
+          void webview.postMessage({ type: 'mcpSaved', seq: msg.seq, servers: mcp.list(), error: err || undefined })
+        } catch (e) {
+          void webview.postMessage({ type: 'mcpSaved', seq: msg.seq, servers: mcp.list(), error: (e as Error).message })
+        }
+        break
+      }
+      case 'mcpRemove': {
+        const name = String(msg.name || '')
+        try {
+          await persistMcpServers(servers => { delete servers[name] })
+          mcp.remove(name)
+          void webview.postMessage({ type: 'mcpSaved', seq: msg.seq, servers: mcp.list() })
+        } catch (e) {
+          void webview.postMessage({ type: 'mcpSaved', seq: msg.seq, servers: mcp.list(), error: (e as Error).message })
+        }
+        break
+      }
+      case 'mcpReconnect': {
+        const name = String(msg.name || '')
+        const err = await mcp.reconnect(name)
+        void webview.postMessage({ type: 'mcpSaved', seq: msg.seq, servers: mcp.list(), error: err || undefined })
         break
       }
     }
