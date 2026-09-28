@@ -352,6 +352,41 @@ body {
   border: 1px solid var(--vscode-input-border, transparent);
 }
 .field input:focus, .field select:focus { outline: 1px solid var(--vscode-focusBorder, #007acc); }
+/* API 地址 + 测试按钮并排 */
+.field-row { display: flex; gap: 8px; align-items: stretch; }
+.field-row input { flex: 1; min-width: 0; }
+.fetch-btn {
+  flex-shrink: 0;
+  padding: 6px 12px; font-size: 11.5px;
+  white-space: nowrap;
+}
+.fetch-btn:disabled { opacity: 0.6; cursor: wait; }
+
+/* 模型选择弹层 */
+.models-pop { padding: 20px 18px 16px; display: flex; flex-direction: column; gap: 12px; max-height: 60vh; }
+.models-list { overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+.model-option {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px;
+  background: rgba(120, 130, 150, 0.08);
+  border: 1px solid rgba(128, 140, 160, 0.2);
+  border-radius: 7px;
+  color: inherit;
+  padding: 10px 12px; font-size: 12.5px;
+  cursor: pointer; text-align: left;
+  word-break: break-all;
+}
+.model-option:hover { background: rgba(120, 140, 170, 0.16); }
+.model-option.on {
+  border-color: rgba(58, 130, 240, 0.6);
+  background: rgba(60, 130, 240, 0.12);
+}
+.model-current {
+  flex-shrink: 0; font-size: 10.5px;
+  padding: 1px 7px; border-radius: 10px;
+  background: rgba(58, 130, 240, 0.2);
+  color: #79aef5;
+}
 .check-row { display: flex; flex-direction: row; align-items: center; gap: 7px; cursor: pointer; }
 .check-row input[type="checkbox"] { width: auto; margin: 0; cursor: pointer; }
 .hint { font-size: 10.5px; opacity: 0.6; }

@@ -42,6 +42,36 @@ function patch(p: Record<string, any>): void {
   flashSaved()
 }
 
+// ---- 测试 API 地址：拉取可用模型列表，自动填充模型名称 ----
+const modelsLoading = ref(false)
+const modelError = ref('')
+const fetchedModels = ref<string[]>([])
+const showModelsPop = ref(false)
+
+/** 请求当前 API 地址的 /models 端点；单个模型直接填充，多个模型弹层选择 */
+async function fetchModels(): Promise<void> {
+  const baseUrl = String(cfg.value.baseUrl || '').trim()
+  if (!baseUrl) { modelError.value = '请先填写 API 地址'; return }
+  modelsLoading.value = true
+  modelError.value = ''
+  try {
+    const models = await call('fetchModels', { baseUrl }) as string[]
+    if (models.length === 1) {
+      patch({ model: models[0] })
+    } else {
+      fetchedModels.value = models
+      showModelsPop.value = true
+    }
+  } catch (e) { modelError.value = String(e) }
+  modelsLoading.value = false
+}
+
+/** 选中模型：即时保存并关闭弹层 */
+function pickModel(id: string): void {
+  patch({ model: id })
+  showModelsPop.value = false
+}
+
 onMounted(() => {
   window.addEventListener('message', (e: MessageEvent) => {
     const m = e.data
@@ -54,6 +84,7 @@ onMounted(() => {
     if (m.error) w.reject(m.error)
     else if (m.type === 'skills') w.resolve(m.items || [])
     else if (m.type === 'skillContent') w.resolve(m.content || '')
+    else if (m.type === 'modelsList') w.resolve(m.models || [])
     else w.resolve(true)
   })
   void call('getConfig').catch(() => undefined)
@@ -255,8 +286,15 @@ function asNumber(e: Event): number { return Number((e.target as HTMLInputElemen
           </div>
           <div class="field">
             <label>API 地址</label>
-            <input :value="cfg.baseUrl" spellcheck="false"
-              @change="(e) => patch({ baseUrl: (e.target as HTMLInputElement).value.trim() })" />
+            <div class="field-row">
+              <input :value="cfg.baseUrl" spellcheck="false"
+                @change="(e) => patch({ baseUrl: (e.target as HTMLInputElement).value.trim() })" />
+              <button type="button" class="btn primary fetch-btn" :disabled="modelsLoading"
+                @click="fetchModels">
+                {{ modelsLoading ? '测试中…' : '测试获取模型' }}
+              </button>
+            </div>
+            <span class="hint">点击「测试获取模型」自动检测并填充可用模型名称</span>
           </div>
           <div class="field">
             <label>API Key</label>
@@ -277,7 +315,25 @@ function asNumber(e: Event): number { return Number((e.target as HTMLInputElemen
               <option value="no">关闭（纯对话）</option>
             </select>
           </div>
+          <div v-if="modelError" class="set-error">⚠️ {{ modelError }}</div>
         </div>
+
+        <!-- 模型选择弹层：接口返回多个模型时展示 -->
+        <van-popup v-model:show="showModelsPop" position="bottom" round teleport="body">
+          <div class="models-pop">
+            <div class="create-title">选择模型（{{ fetchedModels.length }} 个可用）</div>
+            <div class="models-list">
+              <button
+                v-for="id in fetchedModels" :key="id" type="button"
+                class="model-option" :class="{ on: cfg.model === id }"
+                @click="pickModel(id)"
+              >
+                <span>{{ id }}</span>
+                <span v-if="cfg.model === id" class="model-current">当前</span>
+              </button>
+            </div>
+          </div>
+        </van-popup>
       </section>
 
       <!-- 权限审批 -->

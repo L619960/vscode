@@ -1,4 +1,4 @@
-# Codex CN 扩展同步脚本：编译产物 → 运行时目录
+﻿# Codex CN 扩展同步脚本：编译产物 → 运行时目录
 # 用法：在 d:\codex-cn-oss 目录下运行 PowerShell: .\sync-extension.ps1
 
 $ErrorActionPreference = 'Stop'
@@ -54,6 +54,6 @@ if ($missing) {
   exit 1
 }
 
-Write-Host "`n=== 同步完成 ===' -ForegroundColor Green
+Write-Host "`n=== 同步完成 ===" -ForegroundColor Green
 Write-Host "关键文件验证通过: $($critical.Count) 个" -ForegroundColor Green
 Write-Host "`n重启 Codex CN 使更改生效" -ForegroundColor Cyan

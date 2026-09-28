@@ -380,6 +380,41 @@ function activate(context: vscode.ExtensionContext): void {
         // 广播设置变更（聊天页的模型状态等同步刷新）
         postState()
         break
+      case 'fetchModels': {
+        // 测试 API 地址：请求 OpenAI 兼容的 /models 端点，返回可用模型 id 列表
+        const rawUrl = String(msg.baseUrl || '').trim().replace(/\/+$/, '')
+        if (!rawUrl) {
+          void webview.postMessage({ type: 'modelsList', seq: msg.seq, error: '请先填写 API 地址' })
+          break
+        }
+        const url = /\/models?$/i.test(rawUrl) ? rawUrl : `${rawUrl}/models`
+        const key = await getApiKey(context.secrets)
+        try {
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(), 10000)
+          const headers: Record<string, string> = { 'Accept': 'application/json' }
+          if (key) headers['Authorization'] = `Bearer ${key}`
+          const resp = await fetch(url, { headers, signal: controller.signal })
+          clearTimeout(timer)
+          if (!resp.ok) {
+            void webview.postMessage({ type: 'modelsList', seq: msg.seq, error: `服务返回 ${resp.status} ${resp.statusText}` })
+            break
+          }
+          const data = await resp.json() as { data?: Array<{ id?: string }> }
+          const ids = Array.isArray(data.data)
+            ? data.data.map((m) => m?.id).filter((x): x is string => typeof x === 'string' && x.length > 0)
+            : []
+          if (!ids.length) {
+            void webview.postMessage({ type: 'modelsList', seq: msg.seq, error: '接口未返回任何模型（响应缺少 data 列表）' })
+            break
+          }
+          void webview.postMessage({ type: 'modelsList', seq: msg.seq, models: ids })
+        } catch (e) {
+          const reason = (e as Error).name === 'AbortError' ? '请求超时（10 秒无响应），请确认 API 地址可达' : `连接失败：${(e as Error).message}`
+          void webview.postMessage({ type: 'modelsList', seq: msg.seq, error: reason })
+        }
+        break
+      }
       case 'setAgentMode': {
         const supportsTools = msg.mode === 'chat' ? 'no' : 'auto'
         await setConfig({ supportsTools })
