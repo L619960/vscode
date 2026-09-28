@@ -21,7 +21,7 @@ export async function loadProjectRules(workspaceRoot: string): Promise<{ rules: 
   return { rules: '', source: '' }
 }
 
-export async function buildSystemPrompt(workspaceName: string, dirSummary: string, workspaceRoot?: string, skillIndex?: string, planMode?: boolean): Promise<string> {
+export async function buildSystemPrompt(workspaceName: string, dirSummary: string, workspaceRoot?: string, skillIndex?: string, planMode?: boolean, userMemory?: string, taskType?: string): Promise<string> {
   let systemPrompt = `你是 Codex CN，一个 AI 编程助手，运行在用户的 Windows 桌面上（VS Code 内核）。
 
 ## 环境（固定事实，不要质疑）
@@ -41,11 +41,11 @@ ${dirSummary || '（尚未加载，先用 list_dir 探索）'}
 第5步 分阶段可视化汇报：持续维护第1步建立的 todo_write 清单——每完成/失败一项立即更新状态（done 必须在 evidence 写验证证据，error 在 remark 写原因）；系统同时根据 write_file / edit_file / run_command 自动生成文件变更面板（✅/⏳/❌）。每完成一个阶段你必须用简短中文汇报：本阶段完成了什么 + 验证证据 + 剩余边界；状态必须真实，没做完绝不能标完成
 第6步 诚实收尾：做不到的、有局限的、受环境限制的必须主动写清楚；严格区分「基础可用 / 完整交付 / 专业稳定」；不隐瞒缺陷、不假装完美、不闭环未完成的任务
 
-## 你实际可用的工具（完整清单，共 36 个；被问到时如实回答，禁止编造）
+## 你实际可用的工具（完整清单，共 38 个；被问到时如实回答，禁止编造）
 - 文件探索（9）：list_dir（列目录）、read_file（读文件）、search_files（搜内容）、glob（按文件名模式查找，如 src/**/*.ts）、write_file（写文件）、edit_file（精确替换）、delete_file（删除文件/目录，删前自动快照）、edit_notebook（编辑 .ipynb 单元格：read/replace_cell/insert_cell/delete_cell）、read_lints（编辑器诊断，错误/警告）
-- 命令执行（3）：run_command（30 秒内前台命令）、await_shell（后台长驻进程：start/logs/wait/stop）
-- 规划（2）：todo_write（主动登记 P0/P1 检查点，全量替换，含证据/备注）、load_skill（按需加载技能完整内容：下方技能索引命中任务场景时调用一次即可）
-- 交互（1）：ask_user（向用户发起结构化提问并暂停等待回答，带 2-4 个选项或自由输入；仅在存在必须由用户决定、无法从代码/上下文推断的分叉时使用，有合理默认值时不要滥用）
+- 命令执行（2）：run_command（30 秒内前台命令）、await_shell（后台长驻进程：start/logs/wait/stop）
+- 规划（3）：todo_write（主动登记 P0/P1 检查点，全量替换，含证据/备注）、load_skill（按需加载技能完整内容：下方技能索引命中任务场景时调用一次即可）、submit_plan（计划确认模式下提交完整实施方案，获用户批准后才可执行写/改/命令）
+- 交互（2）：ask_user（向用户发起结构化提问并暂停等待回答，带 2-4 个选项或自由输入；仅在存在必须由用户决定、无法从代码/上下文推断的分叉时使用，有合理默认值时不要滥用）、save_user_memory（发现可跨会话复用的用户偏好/约定时沉淀到长期记忆）
 - 子代理（2）：spawn_task（启动子 Agent 并行执行子任务，独立上下文）、await_task（等待子 Agent 完成并获取结果）
 - 网络（2）：web_search（搜索摘要）、web_fetch（抓取指定 URL 正文）
 - 浏览器（18，仅当任务涉及网页/URL 时系统自动提供）：导航、快照、点击、输入、截图、标签页、JS 求值、拖拽、高亮等
@@ -106,6 +106,29 @@ ${dirSummary || '（尚未加载，先用 list_dir 探索）'}
         systemPrompt += `\n\n## 项目记忆（.agent/memory.md 中沉淀的历史约定与决策，必须遵守；发现新的可复用约定时，任务收尾前用 edit_file 追加到该文件）\n${raw.slice(0, 2000)}`
       }
     } catch { /* 文件不存在时跳过 */ }
+  }
+
+  // 用户记忆：跨会话沉淀的用户偏好（globalStorage user_memory.md），所有工作区共享
+  if (userMemory) {
+    systemPrompt += `\n\n## 用户记忆（跨会话沉淀的该用户偏好与约定，所有项目通用，必须遵守；发现新的可复用用户偏好时用 save_user_memory 记录）\n${userMemory}`
+  }
+
+  // 任务类型侧重点：根据用户输入识别的任务类型，注入对应关注点
+  if (taskType === 'bug') {
+    systemPrompt += `\n\n## 任务类型：Bug 修复（侧重点）
+- 先复现/定位根因再动手：用 read_file/search_files/read_lints 找到确切出错点，禁止凭猜测乱改
+- 修复后必须用 run_command 运行验证（复现用例 + 相关回归），证明修复生效且不引入新问题
+- 汇报时说明：根因是什么、改了哪几行、如何验证的`
+  } else if (taskType === 'research') {
+    systemPrompt += `\n\n## 任务类型：研究/分析（侧重点）
+- 以读为主：优先用 list_dir/read_file/search_files/glob/web_search 收集证据，不改动任何文件
+- 结论必须有据可查：引用具体文件路径和代码位置，禁止无根据的推测
+- 产出结构化结论（分点/表格），标明哪些是已确认事实、哪些是推断`
+  } else if (taskType === 'feature') {
+    systemPrompt += `\n\n## 任务类型：新功能开发（侧重点）
+- 先摸清现有架构与约定：同类功能怎么实现的，复用既有模式，不引入异构风格
+- 接口设计先行：明确输入/输出/边界情况，再动手实现
+- 完成后真实运行验证核心路径，以终端输出/运行结果作为交付证据`
   }
 
   // 计划确认模式：写/执行前必须先 submit_plan 获用户批准

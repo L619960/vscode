@@ -13,6 +13,7 @@ import { BackgroundShell } from './backgroundShell.js'
 import { BrowserSession } from './browser.js'
 import { SkillsStore } from './skills.js'
 import { SubAgentManager } from './subAgent.js'
+import { McpManager, type McpServerConfig } from './mcp.js'
 import type { ApprovalDecision, ApprovalRequest } from './executor.js'
 
 let session: Session
@@ -57,11 +58,40 @@ function activate(context: vscode.ExtensionContext): void {
   const skills = new SkillsStore(context.globalStorageUri)
   void skills.ensure()
 
+  // 跨会话用户记忆：globalStorage/user_memory.md（一行一条偏好，注入系统提示词）
+  const userMemUri = vscode.Uri.joinPath(context.globalStorageUri, 'user_memory.md')
+  const getUserMemory = async (): Promise<string> => {
+    try {
+      const buf = await vscode.workspace.fs.readFile(userMemUri)
+      return Buffer.from(buf).toString('utf8').slice(0, 2000)
+    } catch { return '' }
+  }
+  const saveUserMemory = async (content: string): Promise<void> => {
+    await vscode.workspace.fs.createDirectory(context.globalStorageUri)
+    let existing = ''
+    try { existing = Buffer.from(await vscode.workspace.fs.readFile(userMemUri)).toString('utf8') } catch { /* 首次写入 */ }
+    const line = content.trim().replace(/\n+/g, '；')
+    const entry = line.startsWith('- ') ? line : `- ${line}`
+    const next = existing ? `${existing.replace(/\s+$/, '')}\n${entry}\n` : `# 用户记忆（跨会话）\n\n${entry}\n`
+    await vscode.workspace.fs.writeFile(userMemUri, Buffer.from(next, 'utf8'))
+  }
+
   // 有状态工具依赖：任务规划板 / 后台 Shell / 内置浏览器
   const board = new TaskBoard(context.globalState)
   const bgShell = new BackgroundShell()
   const browser = new BrowserSession()
-  context.subscriptions.push({ dispose: () => { bgShell.dispose(); browser.dispose() } })
+
+  // MCP 客户端：连接 codex-cn.mcpServers 配置的外部工具服务器（失败跳过不阻断启动）
+  const mcp = new McpManager()
+  const mcpServers = vscode.workspace.getConfiguration('codex-cn').get<Record<string, McpServerConfig>>('mcpServers', {})
+  if (Object.keys(mcpServers).length > 0) {
+    void mcp.connectAll(mcpServers).then(errors => {
+      if (errors.length > 0) {
+        void vscode.window.showWarningMessage(`Codex CN: 部分 MCP 服务器连接失败：${errors.join('；')}`)
+      }
+    })
+  }
+  context.subscriptions.push({ dispose: () => { bgShell.dispose(); browser.dispose(); mcp.dispose() } })
 
   // 启动时自动在右侧辅助栏聚焦 Agent 聊天面板（Cursor 式默认布局）
   // workbench.view.extension.<container> 打开并聚焦容器；codex-cn.chat.focus 聚焦聊天视图
@@ -152,7 +182,10 @@ function activate(context: vscode.ExtensionContext): void {
       subAgents,
       taskBoard: board,
       skills,
+      mcp,
       planMode: vscode.workspace.getConfiguration('codex-cn').get<boolean>('planMode', false),
+      getUserMemory,
+      saveUserMemory,
     }
     await runAgent(text, deps, cancelSource.token)
     cancelSource = null

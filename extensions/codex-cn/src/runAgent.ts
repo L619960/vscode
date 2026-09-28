@@ -10,6 +10,7 @@ import { buildSystemPrompt } from './prompt.js'
 import { Session, type SessionMessage, type ToolRun } from './session.js'
 import type { TaskBoard, TaskCheckpoint } from './taskBoard.js'
 import type { SkillsStore } from './skills.js'
+import type { McpManager } from './mcp.js'
 import type { ChatMessage, ToolCall } from './types.js'
 
 const MAX_ROUNDS = 200
@@ -69,6 +70,12 @@ export interface AgentDeps {
   skills?: SkillsStore
   /** 计划确认模式：开启后写/执行类工具必须先经 submit_plan 获用户批准 */
   planMode?: boolean
+  /** MCP 工具管理器：外部工具服务器（动态扩展工具集） */
+  mcp?: McpManager
+  /** 跨会话用户记忆写入 */
+  saveUserMemory?: (content: string) => Promise<void>
+  /** 跨会话用户记忆读取（启动时注入） */
+  getUserMemory?: () => Promise<string>
 }
 
 /** 2 层目录摘要 */
@@ -189,13 +196,24 @@ async function buildSkillIndex(skills?: SkillsStore): Promise<string> {
   } catch { return '' }
 }
 
-/** 历史 toolRuns 重建为 API wire 消息，超出字符阈值时压缩早期记录 */
-async function buildApiMessages(session: Session, skills?: SkillsStore, planMode?: boolean): Promise<ChatMessage[]> {
+/** 任务类型识别：bug 修复 / 研究分析 / 新功能开发，注入对应侧重点 */
+function detectTaskType(text: string): string | undefined {
+  const t = text.toLowerCase()
+  if (/bug|fix|报错|错误|崩溃|异常|broken|throw|error/.test(t)) return 'bug'
+  if (/研究|调研|分析|explain|what|how|why|对比|区别|查看/.test(t) && !/开发|实现|添加|创建/.test(t)) return 'research'
+  if (/开发|实现|添加|创建|新建|feature|add|create|build/.test(t)) return 'feature'
+  return undefined
+}
+
+async function buildApiMessages(
+  session: Session, skills?: SkillsStore, planMode?: boolean, userMemory?: string, resolvedText?: string
+): Promise<ChatMessage[]> {
   const folder = vscode.workspace.workspaceFolders?.[0]
   const wsName = folder?.name || '（无）'
   const dirSummary = await buildDirSummary()
   const skillIndex = await buildSkillIndex(skills)
-  const systemPrompt = await buildSystemPrompt(wsName, dirSummary, folder?.uri.fsPath, skillIndex, planMode)
+  const taskType = resolvedText ? detectTaskType(resolvedText) : undefined
+  const systemPrompt = await buildSystemPrompt(wsName, dirSummary, folder?.uri.fsPath, skillIndex, planMode, userMemory, taskType)
   const systemMsg: ChatMessage = { role: 'system', content: systemPrompt }
 
   const all: ChatMessage[] = []
@@ -340,9 +358,10 @@ function withFileNotFoundHint(result: Record<string, unknown>): Record<string, u
 export async function runAgent(userText: string, deps: AgentDeps, token: vscode.CancellationToken): Promise<void> {
   const apiKey = await deps.getApiKey()
   const llmConfig = getLLMConfig(apiKey)
-  let messages = await buildApiMessages(deps.session, deps.skills, deps.planMode)
   const folder = vscode.workspace.workspaceFolders?.[0]
   const resolvedText = folder ? await resolveAtReferences(userText, folder.uri.fsPath) : userText
+  const userMemory = deps.getUserMemory ? await deps.getUserMemory() : ''
+  let messages = await buildApiMessages(deps.session, deps.skills, deps.planMode, userMemory, resolvedText)
   messages.push({ role: 'user', content: resolvedText })
 
   // 用户消息入会话：作为时间线回合的边界，并在 UI 上显示提问原文
@@ -383,7 +402,8 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
       const result = await chatCompletion({
         messages,
         // 浏览器 schema 体量大：仅在任务涉及网页时附带，日常任务每轮省数千 token 的 prefill
-        tools: wantsBrowser(resolvedText) ? TOOL_SCHEMAS : CORE_TOOL_SCHEMAS,
+        // MCP 工具：由外部服务器动态提供，追加在内置工具之后
+        tools: [...(wantsBrowser(resolvedText) ? TOOL_SCHEMAS : CORE_TOOL_SCHEMAS), ...(deps.mcp?.toolSchemas() ?? [])],
         config: llmConfig,
         signal: abort.signal,
         onToken: (t) => {
@@ -603,6 +623,68 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
             messages.push({ role: 'user', content: reminder })
             // 不中断当前工具执行，仅追加提醒
           }
+        }
+
+        // ★MCP 工具：mcp__server__tool 路由到 McpManager（外部服务器，执行前需用户批准）
+        if (tname.startsWith('mcp__')) {
+          if (!deps.mcp?.has(tname)) {
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: `MCP 工具未连接: ${tname}`, recovery: '检查 codex-cn.mcpServers 配置与服务器进程状态' })
+            run.resultSummary = 'MCP 工具未连接'
+          } else {
+            hooks.setStatus('awaiting')
+            const apr = await deps.requestApproval({ toolName: tname, argsSummary: run.argsSummary })
+            if (apr.decision !== 'allow') {
+              run.status = 'rejected'
+              run.resultJson = JSON.stringify({ ok: false, error: `用户拒绝了 MCP 工具调用${apr.reason ? '：' + apr.reason : ''}` })
+              run.resultSummary = '用户拒绝'
+            } else {
+              try {
+                const out = await deps.mcp.call(tname, args)
+                const text = typeof out === 'string' ? out : JSON.stringify(out)
+                run.status = 'done'
+                run.resultJson = JSON.stringify({ ok: true, result: text.slice(0, 8000) })
+                run.resultSummary = text.slice(0, 60).replace(/\n/g, ' ') || '完成'
+              } catch (e) {
+                run.status = 'error'
+                run.resultJson = JSON.stringify({ ok: false, error: (e as Error).message })
+                run.resultSummary = 'MCP 调用失败'
+              }
+            }
+          }
+          deps.session.save()
+          deps.onChange()
+          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+          continue
+        }
+
+        // ★用户记忆：save_user_memory 由 runAgent 特殊处理（追加到 globalStorage user_memory.md，豁免验证闸门）
+        if (tname === 'save_user_memory') {
+          const mem = String(args.content || '').trim()
+          if (!mem) {
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: 'content 为空' })
+            run.resultSummary = '内容为空'
+          } else if (!deps.saveUserMemory) {
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: '记忆写入未启用' })
+            run.resultSummary = '记忆写入未启用'
+          } else {
+            try {
+              await deps.saveUserMemory(mem)
+              run.status = 'done'
+              run.resultJson = JSON.stringify({ ok: true })
+              run.resultSummary = '已记录到用户记忆'
+            } catch (e) {
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, error: (e as Error).message })
+              run.resultSummary = '记录失败'
+            }
+          }
+          deps.session.save()
+          deps.onChange()
+          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+          continue
         }
 
         // ★计划确认：submit_plan 由 runAgent 特殊处理（复用审批通道，方案全文作为问题展示）

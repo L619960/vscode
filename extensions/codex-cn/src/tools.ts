@@ -245,6 +245,20 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'save_user_memory',
+      description: '把发现的跨会话用户偏好/习惯/约定追加到用户记忆文件（如：偏好的技术栈、沟通方式、工作流约定）。每条一行，只记录可复用的长期偏好，不记录任务细节。',
+      parameters: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: '要沉淀的用户偏好（一行，以 "- " 开头）' },
+        },
+        required: ['content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'todo_write',
       description: '设置（全量替换）本次任务的规划清单，用于主动登记调研/设计/开发/验证等检查点。每次传入完整列表。',
       parameters: {
@@ -620,6 +634,7 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
     case 'todo_write': return `${(args.items as unknown[] || []).length} 项检查点`
     case 'load_skill': return String(args.name || '')
     case 'submit_plan': return String(args.plan || '').split('\n')[0].slice(0, 60)
+    case 'save_user_memory': return String(args.content || '').slice(0, 50)
     case 'browser_navigate': return String(args.url || '')
     case 'browser_snapshot': return ''
     case 'browser_click': return `#${args.ref}`
@@ -679,6 +694,7 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
     case 'todo_write': return `已登记 ${result.total ?? 0} 项（P0 ${result.p0 ?? 0}，完成 ${result.done ?? 0}）`
     case 'load_skill': return result.ok ? `已加载技能「${result.name}」` : `加载失败：${result.error || '未知'}`
     case 'submit_plan': return result.ok ? '方案已获用户批准' : `方案未通过：${result.error || result.feedback || '用户要求修改'}`
+    case 'save_user_memory': return result.ok ? '已记录到用户记忆' : `记录失败：${result.error || '未知'}`
     case 'browser_navigate': return `已打开 ${result.title || result.url}`
     case 'browser_snapshot': return `${(result.elements as unknown[])?.length ?? 0} 个可交互元素`
     case 'browser_click': return '已点击'
