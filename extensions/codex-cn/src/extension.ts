@@ -96,10 +96,13 @@ function activate(context: vscode.ExtensionContext): void {
   // 启动时自动在右侧辅助栏聚焦 Agent 聊天面板（Cursor 式默认布局）
   // workbench.view.extension.<container> 打开并聚焦容器；codex-cn.chat.focus 聚焦聊天视图
   // 辅助栏可见性由 VS Code 持久化管理：用户展开一次后，后续启动辅助栏自动展开，chat 自动可见
-  void vscode.commands.executeCommand('workbench.view.extension.codex-cn').then(
-    () => void vscode.commands.executeCommand('codex-cn.chat.focus'),
-    () => void vscode.commands.executeCommand('codex-cn.chat.focus')
-  )
+  // 若用户手动关闭了辅助栏（宽度 0），先切换展开再聚焦
+  void vscode.commands.executeCommand('workbench.action.toggleAuxiliaryBar').then(() => {
+    void vscode.commands.executeCommand('workbench.view.extension.codex-cn').then(
+      () => void vscode.commands.executeCommand('codex-cn.chat.focus'),
+      () => void vscode.commands.executeCommand('codex-cn.chat.focus')
+    )
+  })
 
   registerTabCompletion(context)
 
