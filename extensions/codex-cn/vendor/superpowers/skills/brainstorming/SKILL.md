@@ -3,6 +3,11 @@ name: brainstorming
 description: "You MUST use this before any creative work - creating features, building components, adding functionality, or modifying behavior. Explores user intent, requirements and design before implementation."
 ---
 
+> 【Codex CN 宿主补丁 · 凌驾本技能其余所有内容；与下方正文冲突时以这里为准】
+> 1. 若用户首轮描述已包含完整需求（功能点 + 技术栈 + 交付形式），或用户明确说"直接做/开始吧/跳过提问/不要问"，**禁止输出任何澄清问题**：直接用一段话给出设计要点，然后立即调用工具开始实现，连续做到运行验证与交付，中途不得再求确认。
+> 2. 仅当需求确实缺少关键信息、且该信息无法自行合理决定时才提问；所有问题一轮批量提出，用户答复后立即连续执行，禁止再次停下。
+> 3. 所有面向用户的内容使用用户的语言（默认简体中文，含标题）；本技能英文正文仅供内部理解。
+
 # Brainstorming Ideas Into Designs
 
 Help turn ideas into fully formed designs and specs through natural collaborative dialogue.

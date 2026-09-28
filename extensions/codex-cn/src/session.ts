@@ -50,6 +50,12 @@ export class Session {
   createdAt: number
   updatedAt: number
   messages: SessionMessage[] = []
+  /**
+   * 运行时状态（不持久化）：跨用户回合保持 Agent 流程状态，
+   * 防止每次发消息都被流程闸门要求重新规划。重启后由 runAgent 从消息历史重建。
+   */
+  runtimeDidPlan = false
+  runtimeLoadedSkills?: Set<string>
   private readonly fire: (s: Session) => void
   private readonly getRules: () => SessionRules
 

@@ -24,6 +24,8 @@ let cancelSource: vscode.CancellationTokenSource | null = null
 const pending = new Map<string, (d: ApprovalDecision) => void>()
 // 会话级免审批工具集合
 const autoApproved = new Set<string>()
+/** 审批等待上限：超时自动拒绝并释放执行流，避免 Agent 无限挂起后退化空转 */
+const APPROVAL_TIMEOUT_MS = 120_000
 
 /** Diff 内容供应器：把审批的 old/new 内容用自定义 scheme 暴露给 vscode.diff */
 class DiffContentProvider implements vscode.TextDocumentContentProvider {
@@ -131,17 +133,24 @@ function activate(context: vscode.ExtensionContext): void {
   // 审批桥：请求推给 webview，等待按钮回调；开启自动审批或会话免审批时直接放行
   // 但危险命令（rm/del/shutdown 等）始终询问，防止误操作
   const requestApproval = (req: ApprovalRequest): Promise<ApprovalDecision> => {
+    const auto = vscode.workspace.getConfiguration('codex-cn').get<boolean>('autoApprove', false)
     if (req.toolName === 'ask_user' || req.toolName === 'submit_plan') {
-      // 结构化提问/计划确认永远等用户回答，不走自动审批
+      // 结构化提问必须等用户回答；计划确认在自动审批开启时自动放行（用户已选择免确认连续执行）
+      if (req.toolName === 'submit_plan' && auto) return Promise.resolve({ decision: 'allow' })
     } else if (req.danger) {
       // 危险命令不自动放行，必须人工确认
     } else {
-      const auto = vscode.workspace.getConfiguration('codex-cn').get<boolean>('autoApprove', false)
       if (auto || autoApproved.has(req.toolName)) return Promise.resolve({ decision: 'allow' })
     }
     return new Promise<ApprovalDecision>((resolve) => {
       const id = `apr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-      pending.set(id, resolve)
+      // 超时后自动拒绝：pending.delete 保证只结算一次
+      const timer = setTimeout(() => {
+        if (pending.delete(id)) {
+          resolve({ decision: 'deny', reason: '审批超时（120 秒未操作），如需继续请重新发消息' })
+        }
+      }, APPROVAL_TIMEOUT_MS)
+      pending.set(id, (d) => { clearTimeout(timer); resolve(d) })
       postToWebview({ type: 'approval', id, ...req })
     })
   }
@@ -379,7 +388,7 @@ function activate(context: vscode.ExtensionContext): void {
       }
       case 'saveConfig':
         await saveConfig(msg.patch)
-        void webview.postMessage({ type: 'configSaved' })
+        void webview.postMessage({ type: 'configSaved', seq: msg.seq })
         // 广播设置变更（聊天页的模型状态等同步刷新）
         postState()
         break

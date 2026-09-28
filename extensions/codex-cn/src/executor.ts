@@ -587,7 +587,13 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
       const stderr = String(rawErr || '').length > max ? String(rawErr).slice(0, max) + '\n[输出已截断]' : String(rawErr || '')
       return { ok: true, code: 0, stdout, stderr }
     } catch (e: any) {
-      if (e.killed && e.signal === 'SIGTERM') return { ok: false, error: '命令执行超过 30 秒已终止' }
+      if (e.killed && e.signal === 'SIGTERM') {
+        // Python 脚本超时：极常见根因是 GUI 冒烟脚本末尾 mainloop() 挂起等待人工
+        const guiHint = /^python3?(\.exe)?\s+\S+\.py/i.test(cmd)
+          ? '——若这是 GUI 冒烟脚本，禁止用 mainloop()/input() 挂起等待人工：脚本末尾必须用 root.after(毫秒, root.destroy) 安排自动销毁，让窗口弹出后自行退出'
+          : ''
+        return { ok: false, error: `命令执行超过 30 秒已终止${guiHint}` }
+      }
       // exec 在非零退出码时 reject，stderr/stdout 在 e 上
       if (typeof e.code === 'number') {
         const stdout = String(e.stdout || '').slice(0, 8192)

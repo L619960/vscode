@@ -77,7 +77,14 @@ onMounted(() => {
     const m = e.data
     if (!m) return
     if (m.type === 'config') { cfg.value = m.data; return }
-    if (m.type === 'configSaved') { flashSaved(); return }
+    if (m.type === 'configSaved') {
+      flashSaved()
+      // 配置已真实落盘：结算本次 saveConfig 调用，并用磁盘真值校正乐观 UI（防竞态导致的假开关状态）
+      const wSave = m.seq ? waiters.get(m.seq) : undefined
+      if (wSave) { waiters.delete(m.seq); wSave.resolve(true) }
+      void call('getConfig').then((d) => { cfg.value = d }).catch(() => undefined)
+      return
+    }
     const w = m.seq ? waiters.get(m.seq) : undefined
     if (!w) return
     waiters.delete(m.seq)

@@ -18,6 +18,25 @@ const MAX_ROUNDS = 200
 const MAX_CONSECUTIVE_ERRORS = 3
 /** 连续空回复（无内容无工具调用）上限：空回复不终止，自动催办继续，超限才停止 */
 const MAX_EMPTY_RESPONSES = 3
+/** 同一任务内退化循环熔断上限：连续触发即终止任务 */
+const MAX_LOOP_TRIPS = 2
+
+/**
+ * 退化循环检测：流式文本末尾若有某片段（40~200 字）连续重复 ≥4 次，
+ * 判定模型陷入重复输出（典型场景：审批挂起后刷"等待审批..."假动作）。
+ */
+function detectLoop(text: string): boolean {
+  const tail = text.slice(-2400)
+  if (tail.length < 240) return false
+  for (const unit of [40, 80, 120, 200]) {
+    const frag = tail.slice(-unit)
+    let count = 0
+    let pos = tail.length
+    while (pos - unit >= 0 && tail.slice(pos - unit, pos) === frag) { count++; pos -= unit }
+    if (count >= 4) return true
+  }
+  return false
+}
 
 /** 截断恢复指令：明确禁止重复巨型调用，强制骨架+分批 edit 工作流 */
 const TRUNCATION_RECOVERY = [
@@ -396,21 +415,52 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
   token.onCancellationRequested(() => abort.abort())
 
   let lastAssistantMsg: SessionMessage | undefined
-  // 流程闸门：本任务是否已通过 todo_write 完成需求拆解
-  let didPlan = false
+  // 流程闸门状态：跨用户回合保持（Session 运行时字段）；重启后从消息历史重建
+  const restorePlanState = (): { planned: boolean; skillKeys: string[] } => {
+    const skillKeys = new Set<string>()
+    let planned = false
+    for (const msg of deps.session.messages) {
+      for (const tr of msg.toolRuns || []) {
+        if (tr.name === 'todo_write') planned = true
+        if (tr.name === 'load_skill') {
+          if (/brainstorming|writing-plans/.test(tr.resultSummary)) planned = true
+          try {
+            const r = JSON.parse(tr.resultJson || '{}') as Record<string, unknown>
+            const nm = String(r.name || '').trim()
+            if (nm) {
+              const base = nm.replace(/\.md$/, '')
+              // 成功的加载：vendor 有 file 字段；个人技能无 file（两种可能键都加入，任一重复都拦截）
+              skillKeys.add(`vendor:${base}:${String(r.file || 'SKILL.md')}`)
+              skillKeys.add(`personal:${nm.endsWith('.md') ? nm : `${nm}.md`}`)
+            }
+          } catch { /* 结果非 JSON，忽略 */ }
+        }
+      }
+    }
+    return { planned, skillKeys: [...skillKeys] }
+  }
+  const restored = restorePlanState()
+  let didPlan = deps.session.runtimeDidPlan || restored.planned
+  const loadedSkills: Set<string> = deps.session.runtimeLoadedSkills
+    ?? (deps.session.runtimeLoadedSkills = new Set(restored.skillKeys))
+  /** 统一同步规划状态到会话（跨用户回合保持） */
+  const markPlanned = (): void => { didPlan = true; deps.session.runtimeDidPlan = true }
   // 先读后改闸门：记录已读文件与已改文件（相对路径，统一 \ 为小写便于比较）
   const normPath = (p: unknown): string => String(p || '').replace(/\//g, '\\').toLowerCase()
   const readPaths = new Set<string>()
   const modifiedPaths = new Set<string>()
   let lastVerifyRound = 0   // 最近一次验证类工具（run_command / read_lints / await_shell）成功所在轮
   let lastModifyRound = 0   // 最近一次写类工具成功所在轮
-  let verifyReminded = false // 验证提醒只发一次，防止死循环
-  const loadedSkills = new Set<string>() // 本任务已加载的技能，避免重复加载占上下文
+  let verifyRemindCount = 0 // 验证闸门拦截次数：允许拦截 2 次，第 3 次放行防死循环
   // 计划确认模式：写/执行类工具必须先 submit_plan 并获用户批准
   let planApproved = !deps.planMode
   try {
     let consecutiveErrors = 0
     let consecutiveEmpty = 0
+    let loopTripCount = 0 // 退化循环熔断累计（跨轮，达上限终止任务）
+    let confirmBlocked = 0 // "请确认"零产出收尾拦截次数（最多 2 次防死循环）
+    let stagnantActionRounds = 0 // 连续"只读/规划无推进"轮数
+    let stagnantWarned = 0 // 行动催办次数（最多 2 次防刷屏）
     for (let round = 1; round <= MAX_ROUNDS; round++) {
       if (token.isCancellationRequested || abort.signal.aborted) return
 
@@ -423,6 +473,28 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
       lastAssistantMsg = assistantMsg
       deps.onChange()
 
+      // ★任务锚定：第 2 轮起每轮重申原始目标，防止任务漂移到无关工作（如跑去分析其他文件）
+      if (round > 1) {
+        const goal = resolvedText.replace(/\s+/g, ' ').slice(0, 120)
+        messages.push({
+          role: 'user',
+          content: `[系统锚定] 本轮的唯一任务目标：「${goal}」。下一步动作必须直接服务该目标、使用简体中文，不要重复已完成的工作，不要分析无关文件。`,
+        })
+      }
+
+      // ★行动催办：连续多轮只读取/加载技能/更新规划而无修改或验证——分析瘫痪，强制直接行动
+      if (stagnantActionRounds >= 3 && stagnantWarned < 2) {
+        stagnantWarned++
+        messages.push({
+          role: 'user',
+          content: `[系统·行动催办] 你已连续 ${stagnantActionRounds} 轮只在读取文件/加载技能/更新规划，没有任何修改或验证，属于原地打转。现有产出：${[...modifiedPaths].slice(0, 6).join('、') || '尚无文件'}。本轮必须直接行动，二选一：1) run_command 立即运行冒烟脚本（含 GUI 自毁，禁止 mainloop 挂起）2) edit_file/write_file 修复或补全具体缺口。禁止再重复读取已读文件、禁止再加载已加载技能、禁止只输出分析文本。`,
+        })
+        stagnantActionRounds = 0 // 给一轮响应窗口
+      }
+
+      // 退化循环熔断：流式生成中检测到重复片段即中止本次请求
+      let loopTripped = false
+      let streamBuf = ''
       const result = await chatCompletion({
         messages,
         // 浏览器 schema 体量大：仅在任务涉及网页时附带，日常任务每轮省数千 token 的 prefill
@@ -432,6 +504,11 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         signal: abort.signal,
         onToken: (t) => {
           assistantMsg.content += t
+          streamBuf += t
+          if (!loopTripped && streamBuf.length > 240 && detectLoop(streamBuf)) {
+            loopTripped = true
+            abort.abort()
+          }
           deps.onChange()
         },
         onDegraded: () => {
@@ -439,6 +516,27 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         },
       })
 
+      // 熔断中止：不当作用户取消，走专用纠错路径
+      if (loopTripped) {
+        messages.pop() // 撤下本轮注入的锚定（第 2 轮起），避免与纠错消息叠加
+        loopTripCount++
+        if (loopTripCount >= MAX_LOOP_TRIPS) {
+          assistantMsg.content = assistantMsg.content.slice(0, 160)
+            + '\n\n🚨 连续检测到重复输出（退化循环），已自动停止任务。可重新描述任务、把任务拆小，或开启自动审批后再试。'
+          deps.session.save()
+          deps.onChange()
+          return
+        }
+        assistantMsg.content = assistantMsg.content.slice(0, 160)
+          + '\n\n> 🚨 检测到重复输出（退化循环），本轮已被系统熔断中断。请立即用一次真实的工具调用继续推进任务（如审批被卡就明确告知用户，或换替代方案），禁止再输出重复文本。'
+        messages.push({
+          role: 'user',
+          content: '[系统] 上一轮生成陷入重复循环已被熔断。请立即调用一个直接服务于任务目标的工具继续推进，禁止输出重复或无意义的文本。',
+        })
+        deps.session.save()
+        deps.onChange()
+        continue
+      }
       if (token.isCancellationRequested || abort.signal.aborted) {
         deps.session.save()
         return
@@ -489,17 +587,45 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           deps.onChange()
           continue
         }
+        // ★确认拦截器：检测"求确认/求指示"类收尾措辞
+        const seeksConfirmation = /请.{0,8}确认|确认后(我将|我会|立即|开始)|是否(可以|需要|符合).{0,12}(开始|执行|编码|要求)|请告知|请回复|请选择|请您定夺|您觉得.{0,24}(是否|可否)/.test(result.content)
+        // 场景 A：早期轮次零产出却求确认——用户已要求直接实施，强制立刻开工
+        if (confirmBlocked < 2 && modifiedPaths.size === 0 && round <= 4 && seeksConfirmation) {
+          confirmBlocked++
+          messages.pop() // 撤下这条无工具的 assistant 消息
+          deps.session.remove(assistantMsg)
+          messages.push({
+            role: 'user',
+            content: `[系统] 用户的需求已完整且明确要求"直接连续做完：设计→实现→冒烟验证→交付"，你的设计无需用户确认（见最高优先级铁律第3条）。现在立刻执行：1) 调用 todo_write 建立任务清单 2) 创建目录并写出第一个真实代码文件。禁止再输出任何"请确认/确认后开始"类文本，必须直接用工具行动。`,
+          })
+          deps.session.save()
+          deps.onChange()
+          continue
+        }
+        // 场景 B：冒烟已通过仍就"执行方式"求指示——功能已闭环，强制直接交付汇报
+        if (confirmBlocked < 2 && modifiedPaths.size > 0 && lastVerifyRound >= lastModifyRound && seeksConfirmation) {
+          confirmBlocked++
+          messages.pop()
+          deps.session.remove(assistantMsg)
+          messages.push({
+            role: 'user',
+            content: `[系统] 冒烟验证已经通过、功能已闭环，你不需要再就执行方式征求任何意见（最高优先级铁律第3条）。立即输出最终交付汇报：1) 修改内容（文件与功能点）2) 验证方式（冒烟命令与结果）3) 当前状态（完成度与已知限制）。如实陈述，禁止再提问、禁止再讨论方案选择。`,
+          })
+          deps.session.save()
+          deps.onChange()
+          continue
+        }
         // ★验证闸门：改过文件但改后未跑过任何验证（run_command / read_lints / await_shell），
-        // 拦截本次收尾，回喂验证指令（只提醒一次，防止死循环）
-        if (modifiedPaths.size > 0 && lastVerifyRound < lastModifyRound && !verifyReminded) {
-          verifyReminded = true
+        // 拦截本次收尾回喂验证指令（允许 2 次：防止提醒一次后模型继续折腾再收尾时被放行）
+        if (modifiedPaths.size > 0 && lastVerifyRound < lastModifyRound && verifyRemindCount < 2) {
+          verifyRemindCount++
           messages.pop() // 撤下这条无工具的 assistant 消息
           deps.session.remove(assistantMsg)
           const files = [...modifiedPaths].slice(0, 5).join('、')
-          messages.push({
-            role: 'user',
-            content: `[系统] 验证闸门：你修改了 ${modifiedPaths.size} 个文件（${files}${modifiedPaths.size > 5 ? ' 等' : ''}），但修改后未运行任何验证。请先用 run_command 运行构建/测试/冒烟脚本（GUI 程序用冒烟脚本实例化后销毁，禁止直接跑主入口），或用 read_lints 检查诊断；确认无报错后再收尾汇报。`,
-          })
+          const content = verifyRemindCount === 1
+            ? `[系统] 验证闸门：你修改了 ${modifiedPaths.size} 个文件（${files}${modifiedPaths.size > 5 ? ' 等' : ''}），但修改后未运行任何验证。请先用 run_command 运行构建/测试/冒烟脚本（GUI 程序用冒烟脚本实例化后销毁，禁止直接跑主入口），或用 read_lints 检查诊断；确认无报错后再收尾汇报。`
+            : `[系统] 验证闸门（第 2 次拦截）：你仍未在最后一次修改后跑通任何验证。请立即按错误信息修复并重跑验证；如果验证确实因环境限制无法通过，必须把完整错误信息、失败原因和当前真实完成度如实汇报后才能收尾，禁止假装验证通过、禁止退回重规划。`
+          messages.push({ role: 'user', content })
           deps.session.save()
           deps.onChange()
           continue
@@ -509,391 +635,414 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         return
       }
       consecutiveEmpty = 0
+      let roundHadProgress = false // 本轮是否有修改成功或命令执行（供分析瘫痪检测）
 
       for (let ci = 0; ci < result.toolCalls.length; ci++) {
         const call = result.toolCalls[ci]
         if (token.isCancellationRequested || abort.signal.aborted) { deps.session.save(); return }
 
-        // ★只读并行批：连续多个只读工具（read_file/search_files/glob/web_* 等）无依赖，并行执行省多轮等待
-        if (READ_TOOLS.has(call.function.name)) {
-          const batch: ToolCall[] = [call]
-          while (ci + 1 < result.toolCalls.length && READ_TOOLS.has(result.toolCalls[ci + 1].function.name)) {
-            batch.push(result.toolCalls[++ci])
-          }
-          if (batch.length > 1) {
-            const runs = batch.map(c => {
-              const r: ToolRun = {
-                id: c.id, name: c.function.name, argsSummary: '', argsJson: c.function.arguments,
-                status: 'running', resultJson: '', resultSummary: '',
-              }
-              try { r.argsSummary = summarizeArgs(c.function.name, JSON.parse(c.function.arguments || '{}')) }
-              catch { r.argsSummary = '⚠ 参数格式错误' }
-              assistantMsg.toolRuns!.push(r)
-              return r
-            })
-            deps.onChange()
-            await Promise.all(batch.map(async (c, k) => {
-              const r = runs[k]
-              const hooks: ExecHooks = {
-                setStatus: (s) => { r.status = s as ToolRun['status']; deps.onChange() },
-                requestApproval: (req) => deps.requestApproval(req),
-              }
-              try {
-                const raw = await executeToolWithTimeout(c, hooks, deps.toolDeps)
-                const tr = truncateToolResult(r.name, withFileNotFoundHint(raw))
-                r.status = tr.ok ? 'done' : 'error'
-                r.resultJson = JSON.stringify(tr)
-                r.resultSummary = summarizeResult(r.name, tr)
-                // read_lints 属验证类：并行批里也要更新验证轮次，供验证闸门判断
-                if (tr.ok && r.name === 'read_lints') lastVerifyRound = round
-              } catch (e) {
-                r.status = 'error'
-                r.resultJson = JSON.stringify({ ok: false, error: (e as Error).message })
-                r.resultSummary = '执行异常'
-              }
-            }))
-            for (const r of runs) {
-              messages.push({ role: 'tool', tool_call_id: r.id, content: r.resultJson })
+        // ★工具级异常隔离：单个工具调用的意外异常不能杀死整个 Agent 回合（run 留痕为 error，让模型下轮自我修复）
+        let run: ToolRun | undefined
+        try {
+          // ★只读并行批：连续多个只读工具（read_file/search_files/glob/web_* 等）无依赖，并行执行省多轮等待
+          if (READ_TOOLS.has(call.function.name)) {
+            const batch: ToolCall[] = [call]
+            while (ci + 1 < result.toolCalls.length && READ_TOOLS.has(result.toolCalls[ci + 1].function.name)) {
+              batch.push(result.toolCalls[++ci])
             }
-            deps.session.save()
-            deps.onChange()
-            continue
-          }
-        }
-
-        let args: Record<string, unknown> = {}
-        let argsParseError = ''
-        try { args = JSON.parse(call.function.arguments || '{}') } catch (e) {
-          argsParseError = `工具参数 JSON 解析失败: ${(e as Error).message}。原始参数: ${(call.function.arguments || '').slice(0, 200)}`
-        }
-        const run: ToolRun = {
-          id: call.id,
-          name: call.function.name,
-          argsSummary: argsParseError ? '⚠ 参数格式错误' : summarizeArgs(call.function.name, args),
-          argsJson: call.function.arguments,
-          status: 'running',
-          resultJson: '',
-          resultSummary: '',
-        }
-        assistantMsg.toolRuns!.push(run)
-        deps.onChange()
-
-        if (argsParseError) {
-          // JSON 解析失败：不执行工具。截断特征（length 结束 / 参数异常长）时回喂分批指令
-          const looksTruncated = result.finishReason === 'length'
-            || (call.function.arguments || '').length > 3000
-          const payload = looksTruncated
-            ? { ok: false, error: `工具参数不完整（${result.finishReason === 'length' ? '触及生成长度上限' : 'JSON 被截断'}）`, recovery: TRUNCATION_RECOVERY }
-            : { ok: false, error: argsParseError }
-          run.status = 'error'
-          run.resultJson = JSON.stringify(payload)
-          run.resultSummary = looksTruncated ? '参数被截断，需分批写入' : '参数 JSON 解析失败'
-          deps.session.save()
-          deps.onChange()
-          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-          continue
-        }
-
-        const hooks: ExecHooks = {
-          setStatus: (s) => { run.status = s as ToolRun['status']; deps.onChange() },
-          requestApproval: (req) => deps.requestApproval(req),
-        }
-
-        // 超规模硬拦截：不执行工具，回喂分批写入指令
-        const sizeError = enforceWriteSizePolicy(call.function.name, args)
-        if (sizeError) {
-          run.status = 'error'
-          run.resultJson = JSON.stringify({ ok: false, error: sizeError, recovery: TRUNCATION_RECOVERY })
-          run.resultSummary = '超规模拦截，需分批写入'
-          deps.session.save()
-          deps.onChange()
-          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-          continue
-        }
-
-        // ★流程闸门：写/执行类工具前必须先 todo_write 拆解（本产品六步工作流硬强制）
-        const tname = call.function.name
-        if (tname === 'todo_write') didPlan = true
-        const isBgManage = tname === 'await_shell' && args.action !== 'start'
-        if (!didPlan && WRITE_TOOLS.has(tname) && !isBgManage) {
-          const gateMsg = '流程闸门：调用 write_file / edit_file / run_command / await_shell(start) 之前，必须先调用 todo_write 输出 P0/P1 检查点清单'
-          run.status = 'error'
-          run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: '立即只调用 todo_write（参数 items 为完整检查点数组），再继续执行' })
-          run.resultSummary = '流程闸门：需先规划'
-          deps.session.save()
-          deps.onChange()
-          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-          continue
-        }
-
-        // ★计划闸门：计划确认模式下，写/执行类工具必须先 submit_plan 并获用户批准
-        if (!planApproved && (WRITE_TOOLS.has(tname) || tname === 'run_command' || tname === 'await_shell') && !isBgManage && tname !== 'submit_plan') {
-          const gateMsg = '计划闸门：当前处于计划确认模式，执行写文件/命令前必须先调用 submit_plan 提交实施方案并获用户批准'
-          run.status = 'error'
-          run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: '立即调用 submit_plan（参数 plan 为分步实施方案），等用户批准后再执行' })
-          run.resultSummary = '计划闸门：需先提交方案'
-          deps.session.save()
-          deps.onChange()
-          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-          continue
-        }
-
-        // ★检查点催办：每 5 轮检查一次，有 running 状态超过 10 轮的检查点时提醒更新
-        if (round % 5 === 0 && round > 0 && deps.taskBoard) {
-          const pending = deps.taskBoard.items.filter((i: TaskCheckpoint) => i.status === 'running')
-          if (pending.length > 0) {
-            const names = pending.map((i: TaskCheckpoint) => i.label).slice(0, 3).join('、')
-            const reminder = `[系统提醒] 任务规划中有 ${pending.length} 个检查点仍处于运行状态（如：${names}）。请及时调用 todo_write 更新已完成的检查点状态，或继续推进任务。`
-            messages.push({ role: 'user', content: reminder })
-            // 不中断当前工具执行，仅追加提醒
-          }
-        }
-
-        // ★MCP 工具：mcp__server__tool 路由到 McpManager（外部服务器，执行前需用户批准）
-        if (tname.startsWith('mcp__')) {
-          if (!deps.mcp?.has(tname)) {
-            run.status = 'error'
-            run.resultJson = JSON.stringify({ ok: false, error: `MCP 工具未连接: ${tname}`, recovery: '检查 codex-cn.mcpServers 配置与服务器进程状态' })
-            run.resultSummary = 'MCP 工具未连接'
-          } else {
-            hooks.setStatus('awaiting')
-            const apr = await deps.requestApproval({ toolName: tname, argsSummary: run.argsSummary })
-            if (apr.decision !== 'allow') {
-              run.status = 'rejected'
-              run.resultJson = JSON.stringify({ ok: false, error: `用户拒绝了 MCP 工具调用${apr.reason ? '：' + apr.reason : ''}` })
-              run.resultSummary = '用户拒绝'
-            } else {
-              try {
-                const out = await deps.mcp.call(tname, args)
-                const text = typeof out === 'string' ? out : JSON.stringify(out)
-                run.status = 'done'
-                run.resultJson = JSON.stringify({ ok: true, result: text.slice(0, 8000) })
-                run.resultSummary = text.slice(0, 60).replace(/\n/g, ' ') || '完成'
-              } catch (e) {
-                run.status = 'error'
-                run.resultJson = JSON.stringify({ ok: false, error: (e as Error).message })
-                run.resultSummary = 'MCP 调用失败'
-              }
-            }
-          }
-          deps.session.save()
-          deps.onChange()
-          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-          continue
-        }
-
-        // ★用户记忆：save_user_memory 由 runAgent 特殊处理（追加到 globalStorage user_memory.md，豁免验证闸门）
-        if (tname === 'save_user_memory') {
-          const mem = String(args.content || '').trim()
-          if (!mem) {
-            run.status = 'error'
-            run.resultJson = JSON.stringify({ ok: false, error: 'content 为空' })
-            run.resultSummary = '内容为空'
-          } else if (!deps.saveUserMemory) {
-            run.status = 'error'
-            run.resultJson = JSON.stringify({ ok: false, error: '记忆写入未启用' })
-            run.resultSummary = '记忆写入未启用'
-          } else {
-            try {
-              await deps.saveUserMemory(mem)
-              run.status = 'done'
-              run.resultJson = JSON.stringify({ ok: true })
-              run.resultSummary = '已记录到用户记忆'
-            } catch (e) {
-              run.status = 'error'
-              run.resultJson = JSON.stringify({ ok: false, error: (e as Error).message })
-              run.resultSummary = '记录失败'
-            }
-          }
-          deps.session.save()
-          deps.onChange()
-          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-          continue
-        }
-
-        // ★计划确认：submit_plan 由 runAgent 特殊处理（复用审批通道，方案全文作为问题展示）
-        if (tname === 'submit_plan') {
-          const plan = String(args.plan || '').trim()
-          if (!plan) {
-            run.status = 'error'
-            run.resultJson = JSON.stringify({ ok: false, error: 'submit_plan 缺少 plan 参数' })
-            run.resultSummary = '缺少方案内容'
-          } else {
-            hooks.setStatus('awaiting')
-            const apr = await deps.requestApproval({
-              toolName: 'submit_plan', argsSummary: plan, kind: 'ask',
-              options: ['批准执行', '取消任务'],
-            })
-            if (apr.decision === 'allow' && (apr.reason === '批准执行' || !apr.reason)) {
-              planApproved = true
-              run.status = 'done'
-              run.resultJson = JSON.stringify({ ok: true, note: '方案已获用户批准，现在可以开始执行写/命令类操作' })
-              run.resultSummary = '方案已获用户批准'
-            } else if (apr.decision === 'allow') {
-              // 用户选择了自定义输入（修改意见），不批准但把意见反馈给模型修订
-              run.status = 'error'
-              run.resultJson = JSON.stringify({ ok: false, feedback: apr.reason, recovery: '用户对方案有修改意见（见 feedback），请修订方案后重新调用 submit_plan' })
-              run.resultSummary = '用户要求修改方案'
-            } else {
-              run.status = 'rejected'
-              run.resultJson = JSON.stringify({ ok: false, error: `用户取消了任务（${apr.reason || '未说明'}）` })
-              run.resultSummary = '用户取消任务'
-            }
-          }
-          deps.session.save()
-          deps.onChange()
-          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-          continue
-        }
-
-        // ★技能加载：load_skill 由 runAgent 特殊处理（直接读 SkillsStore，内容作为工具结果进入上下文）
-        if (tname === 'load_skill') {
-          const rawName = String(args.name || '').trim()
-          // vendor 技能附属文件（如 references/xxx.md）；个人技能不用此参数
-          const vendorFile = args.file ? String(args.file).trim() : undefined
-          const fileName = rawName.endsWith('.md') ? rawName : `${rawName}.md`
-          let loaded = false
-
-          // 1) 个人技能优先（现有技能库；读不到则落到 vendor）
-          if (deps.skills && !vendorFile) {
-            const pkey = `personal:${fileName}`
-            if (loadedSkills.has(pkey)) {
-              run.status = 'done'
-              run.resultJson = JSON.stringify({ ok: true, name: rawName, note: '该技能已加载过，完整内容见上文工具结果，请勿重复加载' })
-              run.resultSummary = `技能「${rawName}」已加载过`
-              loaded = true
-            } else {
-              try {
-                const content = await deps.skills.read(fileName)
-                loadedSkills.add(pkey)
-                run.status = 'done'
-                run.resultJson = JSON.stringify({ ok: true, name: rawName, content })
-                run.resultSummary = `已加载技能「${rawName}」`
-                loaded = true
-              } catch { /* 个人技能不存在，继续尝试 vendor */ }
-            }
-          }
-
-          // 2) Superpowers 内置技能（英文目录名；file 参数可读 references 等附属文件）
-          if (!loaded) {
-            const vendorName = rawName.replace(/\.md$/, '')
-            if (!deps.skills || !deps.superpowers) {
-              run.status = 'error'
-              run.resultJson = JSON.stringify({ ok: false, error: `技能不存在或不可读: ${rawName}`, recovery: '从系统提示的技能索引中选择存在的名称重试' })
-              run.resultSummary = '技能不存在'
-            } else {
-              const vkey = `vendor:${vendorName}:${vendorFile || 'SKILL.md'}`
-              if (loadedSkills.has(vkey)) {
-                run.status = 'done'
-                run.resultJson = JSON.stringify({ ok: true, name: vendorName, file: vendorFile, note: '该文件已加载过，内容见上文工具结果，请勿重复加载' })
-                run.resultSummary = `「${vendorName}」已加载过`
-              } else {
-                try {
-                  const content = await deps.skills.readVendor(vendorName, vendorFile)
-                  loadedSkills.add(vkey)
-                  run.status = 'done'
-                  run.resultJson = JSON.stringify({ ok: true, name: vendorName, file: vendorFile, content })
-                  run.resultSummary = vendorFile
-                    ? `已加载「${vendorName}/${vendorFile}」`
-                    : `已加载 Superpowers 技能「${vendorName}」`
-                  // 流程闸门兼容：进入头脑风暴/计划技能即接管规划纪律，不再强制 todo_write 先行
-                  if (!vendorFile && (vendorName === 'brainstorming' || vendorName === 'writing-plans')) {
-                    didPlan = true
-                  }
-                } catch (e) {
-                  run.status = 'error'
-                  run.resultJson = JSON.stringify({ ok: false, error: `技能不存在或不可读: ${vendorName}${vendorFile ? `/${vendorFile}` : ''}（${(e as Error).message}）`, recovery: '从系统提示的 Superpowers 技能索引中选择存在的名称重试' })
-                  run.resultSummary = '技能不存在'
+            if (batch.length > 1) {
+              const runs = batch.map(c => {
+                const r: ToolRun = {
+                  id: c.id, name: c.function.name, argsSummary: '', argsJson: c.function.arguments,
+                  status: 'running', resultJson: '', resultSummary: '',
                 }
+                try { r.argsSummary = summarizeArgs(c.function.name, JSON.parse(c.function.arguments || '{}')) }
+                catch { r.argsSummary = '⚠ 参数格式错误' }
+                assistantMsg.toolRuns!.push(r)
+                return r
+              })
+              deps.onChange()
+              await Promise.all(batch.map(async (c, k) => {
+                const r = runs[k]
+                const hooks: ExecHooks = {
+                  setStatus: (s) => { r.status = s as ToolRun['status']; deps.onChange() },
+                  requestApproval: (req) => deps.requestApproval(req),
+                }
+                try {
+                  const raw = await executeToolWithTimeout(c, hooks, deps.toolDeps)
+                  const tr = truncateToolResult(r.name, withFileNotFoundHint(raw))
+                  r.status = tr.ok ? 'done' : 'error'
+                  r.resultJson = JSON.stringify(tr)
+                  r.resultSummary = summarizeResult(r.name, tr)
+                  // read_lints 属验证类：并行批里也要更新验证轮次，供验证闸门判断
+                  if (tr.ok && r.name === 'read_lints') lastVerifyRound = round
+                } catch (e) {
+                  r.status = 'error'
+                  r.resultJson = JSON.stringify({ ok: false, error: (e as Error).message })
+                  r.resultSummary = '执行异常'
+                }
+              }))
+              for (const r of runs) {
+                messages.push({ role: 'tool', tool_call_id: r.id, content: r.resultJson })
               }
+              deps.session.save()
+              deps.onChange()
+              continue
             }
           }
-          deps.session.save()
-          deps.onChange()
-          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-          continue
-        }
 
-        // ★子代理工具：spawn_task / await_task 由 runAgent 特殊处理（不走 executeToolCall）
-        if (call.function.name === 'spawn_task' || call.function.name === 'await_task') {
-          if (!deps.subAgents) {
-            run.status = 'error'
-            run.resultJson = JSON.stringify({ ok: false, error: '子代理管理器未初始化' })
-            run.resultSummary = '子代理不可用'
-          } else if (call.function.name === 'spawn_task') {
-            const taskDesc = String(args.task || '')
-            const allowedTools = Array.isArray(args.tools) ? args.tools.map(String) : undefined
-            const sub = deps.subAgents.spawn(taskDesc, allowedTools)
-            if (sub.status === 'error') {
-              run.status = 'error'
-              run.resultJson = JSON.stringify({ ok: false, error: sub.error })
-              run.resultSummary = sub.error || '启动失败'
-            } else {
-              run.status = 'done'
-              run.resultJson = JSON.stringify({ ok: true, task_id: sub.id, status: 'running' })
-              run.resultSummary = `子任务 ${sub.id} 已启动`
-            }
-          } else {
-            const taskId = String(args.task_id || '')
-            const timeout = Math.min(Number(args.timeout) || 120_000, 300_000)
-            const sub = await deps.subAgents.await(taskId, timeout, token)
-            run.status = sub.status === 'done' ? 'done' : sub.status === 'timeout' ? 'error' : 'error'
-            run.resultJson = JSON.stringify({ ok: sub.status === 'done', status: sub.status, result: sub.result, error: sub.error })
-            run.resultSummary = sub.status === 'done'
-              ? `子任务完成：${(sub.result || '').slice(0, 60)}`
-              : `子任务${sub.status === 'timeout' ? '超时' : '出错'}：${sub.error || ''}`
+          let args: Record<string, unknown> = {}
+          let argsParseError = ''
+          try { args = JSON.parse(call.function.arguments || '{}') } catch (e) {
+            argsParseError = `工具参数 JSON 解析失败: ${(e as Error).message}。原始参数: ${(call.function.arguments || '').slice(0, 200)}`
           }
-          deps.session.save()
+          run = {
+            id: call.id,
+            name: call.function.name,
+            argsSummary: argsParseError ? '⚠ 参数格式错误' : summarizeArgs(call.function.name, args),
+            argsJson: call.function.arguments,
+            status: 'running',
+            resultJson: '',
+            resultSummary: '',
+          }
+          assistantMsg.toolRuns!.push(run)
           deps.onChange()
-          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-          continue
-        }
 
-        // ★先读后改闸门：修改已存在的文件前，必须先 read_file 过该文件（防止盲改）
-        if (tname === 'read_file') readPaths.add(normPath(args.path))
-        if ((tname === 'edit_file' || tname === 'write_file' || tname === 'edit_notebook') && args.path) {
-          const np = normPath(args.path)
-          let exists = false
-          if (folder) {
-            try { await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, String(args.path))); exists = true } catch { exists = false }
-          }
-          if (exists && !readPaths.has(np)) {
-            const gateMsg = `先读后改闸门：修改已存在的文件 ${args.path} 之前，必须先调用 read_file 读取它（看清上下文再改，禁止盲改）`
+          if (argsParseError) {
+            // JSON 解析失败：不执行工具。截断特征（length 结束 / 参数异常长）时回喂分批指令
+            const looksTruncated = result.finishReason === 'length'
+              || (call.function.arguments || '').length > 3000
+            const payload = looksTruncated
+              ? { ok: false, error: `工具参数不完整（${result.finishReason === 'length' ? '触及生成长度上限' : 'JSON 被截断'}）`, recovery: TRUNCATION_RECOVERY }
+              : { ok: false, error: argsParseError }
             run.status = 'error'
-            run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: `立即调用 read_file（path: "${args.path}"），读完再重新发起本次修改` })
-            run.resultSummary = '先读后改：需先读取该文件'
+            run.resultJson = JSON.stringify(payload)
+            run.resultSummary = looksTruncated ? '参数被截断，需分批写入' : '参数 JSON 解析失败'
             deps.session.save()
             deps.onChange()
             messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
             continue
           }
-        }
 
-        const rawResult = await executeToolWithTimeout(call, hooks, deps.toolDeps)
-        const toolResult = truncateToolResult(run.name, withFileNotFoundHint(rawResult))
-        run.status = toolResult.ok
-          ? 'done'
-          : String(toolResult.error || '').startsWith('用户拒绝') ? 'rejected' : 'error'
-        run.resultJson = JSON.stringify(toolResult)
-        run.resultSummary = summarizeResult(run.name, toolResult)
-        // 追踪修改与验证，供收尾前的验证闸门判断
-        if (toolResult.ok) {
-          if (tname === 'write_file' || tname === 'edit_file' || tname === 'delete_file' || tname === 'edit_notebook') {
-            const np = normPath(args.path)
-            // .agent/memory.md 是记忆沉淀，不算代码修改，不触发验证闸门
-            if (!np.endsWith('.agent\\memory.md')) {
-              modifiedPaths.add(np)
-              lastModifyRound = round
-            }
-          } else if (tname === 'run_command' || tname === 'read_lints' || tname === 'await_shell') {
-            lastVerifyRound = round
+          const hooks: ExecHooks = {
+            setStatus: (s) => { run!.status = s as ToolRun['status']; deps.onChange() },
+            requestApproval: (req) => deps.requestApproval(req),
           }
-        }
-        deps.session.save()
-        deps.onChange()
 
-        messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(toolResult) })
+          // 超规模硬拦截：不执行工具，回喂分批写入指令
+          const sizeError = enforceWriteSizePolicy(call.function.name, args)
+          if (sizeError) {
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: sizeError, recovery: TRUNCATION_RECOVERY })
+            run.resultSummary = '超规模拦截，需分批写入'
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+
+          // ★流程闸门：写/执行类工具前必须先 todo_write 拆解（本产品六步工作流硬强制）
+          const tname = call.function.name
+          if (tname === 'todo_write') markPlanned()
+          const isBgManage = tname === 'await_shell' && args.action !== 'start'
+          if (!didPlan && WRITE_TOOLS.has(tname) && !isBgManage) {
+            const gateMsg = '流程闸门：调用 write_file / edit_file / run_command / await_shell(start) 之前，必须先调用 todo_write 输出 P0/P1 检查点清单'
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: '立即只调用 todo_write（参数 items 为完整检查点数组），再继续执行' })
+            run.resultSummary = '流程闸门：需先规划'
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+
+          // ★计划闸门：计划确认模式下，写/执行类工具必须先 submit_plan 并获用户批准
+          if (!planApproved && (WRITE_TOOLS.has(tname) || tname === 'run_command' || tname === 'await_shell') && !isBgManage && tname !== 'submit_plan') {
+            const gateMsg = '计划闸门：当前处于计划确认模式，执行写文件/命令前必须先调用 submit_plan 提交实施方案并获用户批准'
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: '立即调用 submit_plan（参数 plan 为分步实施方案），等用户批准后再执行' })
+            run.resultSummary = '计划闸门：需先提交方案'
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+
+          // ★检查点催办：每 5 轮检查一次，有 running 状态超过 10 轮的检查点时提醒更新
+          if (round % 5 === 0 && round > 0 && deps.taskBoard) {
+            const pending = deps.taskBoard.items.filter((i: TaskCheckpoint) => i.status === 'running')
+            if (pending.length > 0) {
+              const names = pending.map((i: TaskCheckpoint) => i.label).slice(0, 3).join('、')
+              const reminder = `[系统提醒] 任务规划中有 ${pending.length} 个检查点仍处于运行状态（如：${names}）。请及时调用 todo_write 更新已完成的检查点状态，或继续推进任务。`
+              messages.push({ role: 'user', content: reminder })
+              // 不中断当前工具执行，仅追加提醒
+            }
+          }
+
+          // ★MCP 工具：mcp__server__tool 路由到 McpManager（外部服务器，执行前需用户批准）
+          if (tname.startsWith('mcp__')) {
+            if (!deps.mcp?.has(tname)) {
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, error: `MCP 工具未连接: ${tname}`, recovery: '检查 codex-cn.mcpServers 配置与服务器进程状态' })
+              run.resultSummary = 'MCP 工具未连接'
+            } else {
+              hooks.setStatus('awaiting')
+              const apr = await deps.requestApproval({ toolName: tname, argsSummary: run.argsSummary })
+              if (apr.decision !== 'allow') {
+                run.status = 'rejected'
+                run.resultJson = JSON.stringify({ ok: false, error: `用户拒绝了 MCP 工具调用${apr.reason ? '：' + apr.reason : ''}` })
+                run.resultSummary = '用户拒绝'
+              } else {
+                try {
+                  const out = await deps.mcp.call(tname, args)
+                  const text = typeof out === 'string' ? out : JSON.stringify(out)
+                  run.status = 'done'
+                  run.resultJson = JSON.stringify({ ok: true, result: text.slice(0, 8000) })
+                  run.resultSummary = text.slice(0, 60).replace(/\n/g, ' ') || '完成'
+                } catch (e) {
+                  run.status = 'error'
+                  run.resultJson = JSON.stringify({ ok: false, error: (e as Error).message })
+                  run.resultSummary = 'MCP 调用失败'
+                }
+              }
+            }
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+
+          // ★用户记忆：save_user_memory 由 runAgent 特殊处理（追加到 globalStorage user_memory.md，豁免验证闸门）
+          if (tname === 'save_user_memory') {
+            const mem = String(args.content || '').trim()
+            if (!mem) {
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, error: 'content 为空' })
+              run.resultSummary = '内容为空'
+            } else if (!deps.saveUserMemory) {
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, error: '记忆写入未启用' })
+              run.resultSummary = '记忆写入未启用'
+            } else {
+              try {
+                await deps.saveUserMemory(mem)
+                run.status = 'done'
+                run.resultJson = JSON.stringify({ ok: true })
+                run.resultSummary = '已记录到用户记忆'
+              } catch (e) {
+                run.status = 'error'
+                run.resultJson = JSON.stringify({ ok: false, error: (e as Error).message })
+                run.resultSummary = '记录失败'
+              }
+            }
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+
+          // ★计划确认：submit_plan 由 runAgent 特殊处理（复用审批通道，方案全文作为问题展示）
+          if (tname === 'submit_plan') {
+            const plan = String(args.plan || '').trim()
+            if (!plan) {
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, error: 'submit_plan 缺少 plan 参数' })
+              run.resultSummary = '缺少方案内容'
+            } else {
+              hooks.setStatus('awaiting')
+              const apr = await deps.requestApproval({
+                toolName: 'submit_plan', argsSummary: plan, kind: 'ask',
+                options: ['批准执行', '取消任务'],
+              })
+              if (apr.decision === 'allow' && (apr.reason === '批准执行' || !apr.reason)) {
+                planApproved = true
+                run.status = 'done'
+                run.resultJson = JSON.stringify({ ok: true, note: '方案已获用户批准，现在可以开始执行写/命令类操作' })
+                run.resultSummary = '方案已获用户批准'
+              } else if (apr.decision === 'allow') {
+                // 用户选择了自定义输入（修改意见），不批准但把意见反馈给模型修订
+                run.status = 'error'
+                run.resultJson = JSON.stringify({ ok: false, feedback: apr.reason, recovery: '用户对方案有修改意见（见 feedback），请修订方案后重新调用 submit_plan' })
+                run.resultSummary = '用户要求修改方案'
+              } else {
+                run.status = 'rejected'
+                run.resultJson = JSON.stringify({ ok: false, error: `用户取消了任务（${apr.reason || '未说明'}）` })
+                run.resultSummary = '用户取消任务'
+              }
+            }
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+
+          // ★技能加载：load_skill 由 runAgent 特殊处理（直接读 SkillsStore，内容作为工具结果进入上下文）
+          if (tname === 'load_skill') {
+            const rawName = String(args.name || '').trim()
+            // vendor 技能附属文件（如 references/xxx.md）；个人技能不用此参数
+            const vendorFile = args.file ? String(args.file).trim() : undefined
+            const fileName = rawName.endsWith('.md') ? rawName : `${rawName}.md`
+            let loaded = false
+
+            // 1) 个人技能优先（现有技能库；读不到则落到 vendor）
+            if (deps.skills && !vendorFile) {
+              const pkey = `personal:${fileName}`
+              if (loadedSkills.has(pkey)) {
+                run.status = 'done'
+                run.resultJson = JSON.stringify({ ok: true, name: rawName, note: '该技能已加载过，完整内容见上文工具结果，请勿重复加载' })
+                run.resultSummary = `技能「${rawName}」已加载过`
+                loaded = true
+              } else {
+                try {
+                  const content = await deps.skills.read(fileName)
+                  loadedSkills.add(pkey)
+                  run.status = 'done'
+                  run.resultJson = JSON.stringify({ ok: true, name: rawName, content })
+                  run.resultSummary = `已加载技能「${rawName}」`
+                  loaded = true
+                } catch { /* 个人技能不存在，继续尝试 vendor */ }
+              }
+            }
+
+            // 2) Superpowers 内置技能（英文目录名；file 参数可读 references 等附属文件）
+            if (!loaded) {
+              const vendorName = rawName.replace(/\.md$/, '')
+              if (!deps.skills || !deps.superpowers) {
+                run.status = 'error'
+                run.resultJson = JSON.stringify({ ok: false, error: `技能不存在或不可读: ${rawName}`, recovery: '从系统提示的技能索引中选择存在的名称重试' })
+                run.resultSummary = '技能不存在'
+              } else {
+                const vkey = `vendor:${vendorName}:${vendorFile || 'SKILL.md'}`
+                if (loadedSkills.has(vkey)) {
+                  run.status = 'done'
+                  run.resultJson = JSON.stringify({ ok: true, name: vendorName, file: vendorFile, note: '该文件已加载过，内容见上文工具结果，请勿重复加载' })
+                  run.resultSummary = `「${vendorName}」已加载过`
+                } else {
+                  try {
+                    const content = await deps.skills.readVendor(vendorName, vendorFile)
+                    loadedSkills.add(vkey)
+                    run.status = 'done'
+                    run.resultJson = JSON.stringify({ ok: true, name: vendorName, file: vendorFile, content })
+                    run.resultSummary = vendorFile
+                      ? `已加载「${vendorName}/${vendorFile}」`
+                      : `已加载 Superpowers 技能「${vendorName}」`
+                    // 流程闸门兼容：进入头脑风暴/计划技能即接管规划纪律，不再强制 todo_write 先行
+                    if (!vendorFile && (vendorName === 'brainstorming' || vendorName === 'writing-plans')) {
+                      markPlanned()
+                    }
+                  } catch (e) {
+                    run.status = 'error'
+                    run.resultJson = JSON.stringify({ ok: false, error: `技能不存在或不可读: ${vendorName}${vendorFile ? `/${vendorFile}` : ''}（${(e as Error).message}）`, recovery: '从系统提示的 Superpowers 技能索引中选择存在的名称重试' })
+                    run.resultSummary = '技能不存在'
+                  }
+                }
+              }
+            }
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+
+          // ★子代理工具：spawn_task / await_task 由 runAgent 特殊处理（不走 executeToolCall）
+          if (call.function.name === 'spawn_task' || call.function.name === 'await_task') {
+            if (!deps.subAgents) {
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, error: '子代理管理器未初始化' })
+              run.resultSummary = '子代理不可用'
+            } else if (call.function.name === 'spawn_task') {
+              const taskDesc = String(args.task || '')
+              const allowedTools = Array.isArray(args.tools) ? args.tools.map(String) : undefined
+              const sub = deps.subAgents.spawn(taskDesc, allowedTools)
+              if (sub.status === 'error') {
+                run.status = 'error'
+                run.resultJson = JSON.stringify({ ok: false, error: sub.error })
+                run.resultSummary = sub.error || '启动失败'
+              } else {
+                run.status = 'done'
+                run.resultJson = JSON.stringify({ ok: true, task_id: sub.id, status: 'running' })
+                run.resultSummary = `子任务 ${sub.id} 已启动`
+              }
+            } else {
+              const taskId = String(args.task_id || '')
+              const timeout = Math.min(Number(args.timeout) || 120_000, 300_000)
+              const sub = await deps.subAgents.await(taskId, timeout, token)
+              run.status = sub.status === 'done' ? 'done' : sub.status === 'timeout' ? 'error' : 'error'
+              run.resultJson = JSON.stringify({ ok: sub.status === 'done', status: sub.status, result: sub.result, error: sub.error })
+              run.resultSummary = sub.status === 'done'
+                ? `子任务完成：${(sub.result || '').slice(0, 60)}`
+                : `子任务${sub.status === 'timeout' ? '超时' : '出错'}：${sub.error || ''}`
+            }
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+
+          // ★先读后改闸门：修改已存在的文件前，必须先 read_file 过该文件（防止盲改）
+          if (tname === 'read_file') readPaths.add(normPath(args.path))
+          if ((tname === 'edit_file' || tname === 'write_file' || tname === 'edit_notebook') && args.path) {
+            const np = normPath(args.path)
+            let exists = false
+            if (folder) {
+              try { await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, String(args.path))); exists = true } catch { exists = false }
+            }
+            if (exists && !readPaths.has(np)) {
+              const gateMsg = `先读后改闸门：修改已存在的文件 ${args.path} 之前，必须先调用 read_file 读取它（看清上下文再改，禁止盲改）`
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: `立即调用 read_file（path: "${args.path}"），读完再重新发起本次修改` })
+              run.resultSummary = '先读后改：需先读取该文件'
+              deps.session.save()
+              deps.onChange()
+              messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+              continue
+            }
+          }
+
+          const rawResult = await executeToolWithTimeout(call, hooks, deps.toolDeps)
+          const toolResult = truncateToolResult(run.name, withFileNotFoundHint(rawResult))
+          run.status = toolResult.ok
+            ? 'done'
+            : String(toolResult.error || '').startsWith('用户拒绝') ? 'rejected' : 'error'
+          run.resultJson = JSON.stringify(toolResult)
+          run.resultSummary = summarizeResult(run.name, toolResult)
+          // 追踪修改与验证，供收尾前的验证闸门判断
+          if (toolResult.ok) {
+            if (tname === 'write_file' || tname === 'edit_file' || tname === 'delete_file' || tname === 'edit_notebook') {
+              roundHadProgress = true
+              const np = normPath(args.path)
+              // .agent/memory.md 是记忆沉淀，不算代码修改，不触发验证闸门
+              if (!np.endsWith('.agent\\memory.md')) {
+                modifiedPaths.add(np)
+                lastModifyRound = round
+              }
+              // 文件刚由本会话写入/改完，其最新内容模型已知，后续 edit 不再要求先读
+              if (tname === 'write_file' || tname === 'edit_file') readPaths.add(np)
+            } else if (tname === 'run_command' || tname === 'read_lints' || tname === 'await_shell') {
+              lastVerifyRound = round
+            }
+          }
+          // 执行了命令（即使失败）也算在行动，不算分析瘫痪
+          if (tname === 'run_command' || tname === 'await_shell') roundHadProgress = true
+          deps.session.save()
+          deps.onChange()
+
+          messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(toolResult) })
+        } catch (e) {
+          // 兜底：意外异常落为该 run 的 error 痕迹与 tool 消息，模型下轮可自我修复，回合不被杀
+          const errMsg = `工具执行异常: ${(e as Error).message}`
+          if (run) {
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: errMsg })
+            run.resultSummary = '执行异常'
+          }
+          messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ ok: false, error: errMsg }) })
+          deps.session.save()
+          deps.onChange()
+        }
       }
+      // 本轮有修改/命令执行则清零停滞计数；全是只读/规划/被拦则累积（达 3 轮下轮注入行动催办）
+      stagnantActionRounds = roundHadProgress ? 0 : stagnantActionRounds + 1
     }
     deps.session.add({
       role: 'assistant',
