@@ -247,6 +247,40 @@ export const TOOL_SCHEMAS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'spawn_task',
+      description: '启动一个子 Agent 并行执行子任务（独立上下文，不共享当前会话）。用于可并行的大范围探索、专项审查、独立模块开发。子 Agent 有自己的工具调用能力，完成后结果自动回传。',
+      parameters: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: '子任务描述（具体、可自测）' },
+          tools: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '子 Agent 可用的工具白名单（如 ["read_file","search_files"]）。默认继承全部工具，限制可防误操作。',
+          },
+        },
+        required: ['task'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'await_task',
+      description: '等待指定子 Agent 完成并获取结果。spawn_task 返回后立即调用会阻塞等待；也可先做其他事再回来收取。',
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'spawn_task 返回的任务 id' },
+          timeout: { type: 'integer', description: '最长等待毫秒，默认 120000' },
+        },
+        required: ['task_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'browser_navigate',
       description: '在内置浏览器中打开 URL（页面在后台加载），加载完成后可用 browser_snapshot 查看。',
       parameters: {
@@ -405,6 +439,8 @@ export const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'r
 export const BROWSER_TOOLS = new Set(['browser_navigate', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_press_key', 'browser_fill', 'browser_select_option', 'browser_scroll', 'browser_screenshot', 'browser_tabs', 'browser_eval'])
 /** 规划类（AI 主动登记，无副作用） */
 export const PLAN_TOOLS = new Set(['todo_write'])
+/** 子代理工具（spawn/await，由 runAgent 特殊处理） */
+export const TASK_TOOLS = new Set(['spawn_task', 'await_task'])
 
 export function summarizeArgs(name: string, args: Record<string, unknown>): string {
   if (!args || typeof args !== 'object') return ''
@@ -440,6 +476,8 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
     case 'browser_screenshot': return args.full_page ? '整页' : '可视区'
     case 'browser_tabs': return String(args.action || '')
     case 'browser_eval': return String(args.script || '').slice(0, 60)
+    case 'spawn_task': return String(args.task || '').slice(0, 60)
+    case 'await_task': return String(args.task_id || '')
     default:
       return JSON.stringify(args).slice(0, 80)
   }
@@ -485,6 +523,8 @@ export function summarizeResult(name: string, result: Record<string, unknown>): 
     case 'browser_screenshot': return `截图 ${result.path}`
     case 'browser_tabs': return `${(result.tabs as unknown[])?.length ?? 0} 个标签`
     case 'browser_eval': return '已执行'
+    case 'spawn_task': return `子任务 ${result.task_id} 已启动`
+    case 'await_task': return result.status === 'done' ? `子任务完成：${String(result.result || '').slice(0, 80)}` : `子任务${result.status === 'timeout' ? '超时' : '出错'}`
     default:
       return '完成'
   }

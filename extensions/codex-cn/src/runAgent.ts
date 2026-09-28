@@ -5,6 +5,7 @@ import { chatCompletion } from './llm.js'
 import { getLLMConfig } from './config.js'
 import { TOOL_SCHEMAS, WRITE_TOOLS, summarizeArgs, summarizeResult } from './tools.js'
 import { executeToolCall, type ApprovalDecision, type ApprovalRequest, type ExecHooks, type ToolDeps } from './executor.js'
+import { SubAgentManager } from './subAgent.js'
 import { buildSystemPrompt } from './prompt.js'
 import { Session, type SessionMessage, type ToolRun } from './session.js'
 import type { ChatMessage, ToolCall } from './types.js'
@@ -61,6 +62,7 @@ export interface AgentDeps {
   requestApproval(req: ApprovalRequest): Promise<ApprovalDecision>
   onChange(): void
   toolDeps: ToolDeps
+  subAgents?: SubAgentManager
 }
 
 /** 2 层目录摘要 */
@@ -474,6 +476,41 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           run.status = 'error'
           run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: '立即只调用 todo_write（参数 items 为完整检查点数组），再继续执行' })
           run.resultSummary = '流程闸门：需先规划'
+          deps.session.save()
+          deps.onChange()
+          messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+          continue
+        }
+
+        // ★子代理工具：spawn_task / await_task 由 runAgent 特殊处理（不走 executeToolCall）
+        if (call.function.name === 'spawn_task' || call.function.name === 'await_task') {
+          if (!deps.subAgents) {
+            run.status = 'error'
+            run.resultJson = JSON.stringify({ ok: false, error: '子代理管理器未初始化' })
+            run.resultSummary = '子代理不可用'
+          } else if (call.function.name === 'spawn_task') {
+            const taskDesc = String(args.task || '')
+            const allowedTools = Array.isArray(args.tools) ? args.tools.map(String) : undefined
+            const sub = deps.subAgents.spawn(taskDesc, allowedTools)
+            if (sub.status === 'error') {
+              run.status = 'error'
+              run.resultJson = JSON.stringify({ ok: false, error: sub.error })
+              run.resultSummary = sub.error || '启动失败'
+            } else {
+              run.status = 'done'
+              run.resultJson = JSON.stringify({ ok: true, task_id: sub.id, status: 'running' })
+              run.resultSummary = `子任务 ${sub.id} 已启动`
+            }
+          } else {
+            const taskId = String(args.task_id || '')
+            const timeout = Math.min(Number(args.timeout) || 120_000, 300_000)
+            const sub = await deps.subAgents.await(taskId, timeout, token)
+            run.status = sub.status === 'done' ? 'done' : sub.status === 'timeout' ? 'error' : 'error'
+            run.resultJson = JSON.stringify({ ok: sub.status === 'done', status: sub.status, result: sub.result, error: sub.error })
+            run.resultSummary = sub.status === 'done'
+              ? `子任务完成：${(sub.result || '').slice(0, 60)}`
+              : `子任务${sub.status === 'timeout' ? '超时' : '出错'}：${sub.error || ''}`
+          }
           deps.session.save()
           deps.onChange()
           messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })

@@ -12,6 +12,7 @@ import { TaskBoard } from './taskBoard.js'
 import { BackgroundShell } from './backgroundShell.js'
 import { BrowserSession } from './browser.js'
 import { SkillsStore } from './skills.js'
+import { SubAgentManager } from './subAgent.js'
 import type { ApprovalDecision, ApprovalRequest } from './executor.js'
 
 let session: Session
@@ -123,10 +124,15 @@ function activate(context: vscode.ExtensionContext): void {
     })
   }
 
-  // 停止当前 Agent 任务：取消 token + 按拒绝释放全部待审批
+  // 子 Agent 管理器：spawn_task / await_task 的后端
+  const subAgents = new SubAgentManager(() => getApiKey(context.secrets), { board, bgShell, browser })
+  context.subscriptions.push({ dispose: () => { subAgents.stopAll() } })
+
+  // 停止当前 Agent 任务：取消 token + 按拒绝释放全部待审批 + 停掉全部子 Agent
   const stopAgent = (): void => {
     cancelSource?.cancel()
     cancelSource = null
+    subAgents.stopAll()
     for (const [id, resolve] of pending) { resolve({ decision: 'deny', reason: '用户停止了任务' }); pending.delete(id) }
     postState({ running: false })
   }
@@ -141,6 +147,7 @@ function activate(context: vscode.ExtensionContext): void {
       requestApproval,
       onChange: () => postState(),
       toolDeps: { board, bgShell, browser },
+      subAgents,
     }
     await runAgent(text, deps, cancelSource.token)
     cancelSource = null
