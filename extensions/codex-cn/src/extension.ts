@@ -63,11 +63,13 @@ function activate(context: vscode.ExtensionContext): void {
   const browser = new BrowserSession()
   context.subscriptions.push({ dispose: () => { bgShell.dispose(); browser.dispose() } })
 
-  // 首次启动自动在右侧辅助栏打开 Agent 面板（Cursor 式默认布局），仅一次
-  if (!context.globalState.get('codex-cn.autofocused')) {
-    void context.globalState.update('codex-cn.autofocused', true)
-    void vscode.commands.executeCommand('codex-cn.chat.focus')
-  }
+  // 启动时自动在右侧辅助栏聚焦 Agent 聊天面板（Cursor 式默认布局）
+  // workbench.view.extension.<container> 打开并聚焦容器；codex-cn.chat.focus 聚焦聊天视图
+  // 辅助栏可见性由 VS Code 持久化管理：用户展开一次后，后续启动辅助栏自动展开，chat 自动可见
+  void vscode.commands.executeCommand('workbench.view.extension.codex-cn').then(
+    () => void vscode.commands.executeCommand('codex-cn.chat.focus'),
+    () => void vscode.commands.executeCommand('codex-cn.chat.focus')
+  )
 
   registerTabCompletion(context)
 
@@ -148,6 +150,7 @@ function activate(context: vscode.ExtensionContext): void {
       onChange: () => postState(),
       toolDeps: { board, bgShell, browser },
       subAgents,
+      taskBoard: board,
     }
     await runAgent(text, deps, cancelSource.token)
     cancelSource = null
@@ -452,7 +455,7 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly extensionUri: vscode.Uri,
     private readonly sinks: Set<vscode.Webview>,
     private readonly handleMessage: (webview: vscode.Webview, msg: any) => Promise<void>,
-  ) {}
+  ) { }
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.sinks.add(view.webview)

@@ -8,9 +8,10 @@ import { executeToolCall, type ApprovalDecision, type ApprovalRequest, type Exec
 import { SubAgentManager } from './subAgent.js'
 import { buildSystemPrompt } from './prompt.js'
 import { Session, type SessionMessage, type ToolRun } from './session.js'
+import type { TaskBoard, TaskCheckpoint } from './taskBoard.js'
 import type { ChatMessage, ToolCall } from './types.js'
 
-const MAX_ROUNDS = 50
+const MAX_ROUNDS = 200
 /** 连续 LLM 错误上限：超过则终止任务，避免死循环 */
 const MAX_CONSECUTIVE_ERRORS = 3
 /** 连续空回复（无内容无工具调用）上限：空回复不终止，自动催办继续，超限才停止 */
@@ -63,6 +64,7 @@ export interface AgentDeps {
   onChange(): void
   toolDeps: ToolDeps
   subAgents?: SubAgentManager
+  taskBoard?: TaskBoard
 }
 
 /** 2 层目录摘要 */
@@ -192,11 +194,11 @@ async function buildApiMessages(session: Session): Promise<ChatMessage[]> {
         content: m.content || null,
         ...(doneRuns.length
           ? {
-              tool_calls: doneRuns.map((t) => ({
-                id: t.id, type: 'function' as const,
-                function: { name: t.name, arguments: t.argsJson || '{}' },
-              })),
-            }
+            tool_calls: doneRuns.map((t) => ({
+              id: t.id, type: 'function' as const,
+              function: { name: t.name, arguments: t.argsJson || '{}' },
+            })),
+          }
           : {}),
       })
       for (const t of doneRuns) {
@@ -272,7 +274,7 @@ async function executeToolWithTimeout(call: ToolCall, hooks: ExecHooks, deps: To
   let timer: ReturnType<typeof setTimeout> | undefined
   let remaining = limit
   let stageStart = Date.now()
-  let raceResolve: (v: Record<string, unknown>) => void = () => {}
+  let raceResolve: (v: Record<string, unknown>) => void = () => { }
   const timeoutP = new Promise<Record<string, unknown>>((resolve) => {
     raceResolve = resolve
     timer = setTimeout(() => raceResolve({ ok: false, error: `工具执行超过 ${limit / 1000} 秒已超时。请缩小操作范围或换一种方式重试` }), limit)
@@ -283,7 +285,16 @@ async function executeToolWithTimeout(call: ToolCall, hooks: ExecHooks, deps: To
       // 进入人工审批：暂停超时计时
       if (timer) { clearTimeout(timer); timer = undefined; remaining -= Date.now() - stageStart }
       try {
-        return await hooks.requestApproval(req)
+        // 审批超时 60 秒：超时自动拒绝，避免 Agent 无限等待
+        const APPROVAL_TIMEOUT = 60000
+        const approvalP = hooks.requestApproval(req)
+        const timeoutP = new Promise<ApprovalDecision>((_, reject) => {
+          setTimeout(() => reject(new Error('审批超时 60 秒，自动拒绝')), APPROVAL_TIMEOUT)
+        })
+        return await Promise.race([approvalP, timeoutP])
+      } catch (e) {
+        // 审批超时或错误：返回拒绝
+        return { decision: 'deny' as const, reason: (e as Error).message || '审批超时或取消' }
       } finally {
         // 审批结束：恢复剩余计时（至少保留 5 秒给命令本身）
         stageStart = Date.now()
@@ -480,6 +491,17 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           deps.onChange()
           messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
           continue
+        }
+
+        // ★检查点催办：每 5 轮检查一次，有 running 状态超过 10 轮的检查点时提醒更新
+        if (round % 5 === 0 && round > 0 && deps.taskBoard) {
+          const pending = deps.taskBoard.items.filter((i: TaskCheckpoint) => i.status === 'running')
+          if (pending.length > 0) {
+            const names = pending.map((i: TaskCheckpoint) => i.label).slice(0, 3).join('、')
+            const reminder = `[系统提醒] 任务规划中有 ${pending.length} 个检查点仍处于运行状态（如：${names}）。请及时调用 todo_write 更新已完成的检查点状态，或继续推进任务。`
+            messages.push({ role: 'user', content: reminder })
+            // 不中断当前工具执行，仅追加提醒
+          }
         }
 
         // ★子代理工具：spawn_task / await_task 由 runAgent 特殊处理（不走 executeToolCall）
