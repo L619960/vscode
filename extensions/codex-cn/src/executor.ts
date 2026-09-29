@@ -10,6 +10,7 @@ import { READ_TOOLS, WRITE_TOOLS, BROWSER_TOOLS, PLAN_TOOLS, summarizeArgs } fro
 import { getAgentSettings } from './config.js'
 import { saveCheckpoint } from './checkpoints.js'
 import { webSearch } from './webSearch.js'
+import { ErrorPatternMatcher } from './errorPatternMatcher.js'
 import type { TaskBoard, TaskCheckpoint } from './taskBoard.js'
 import type { BackgroundShell } from './backgroundShell.js'
 import type { BrowserSession } from './browser.js'
@@ -609,6 +610,31 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
       if (rewritten && !rewritten.includes('""')) {
         result = await runOnce(rewritten)
         if (result.ok) result.note = `已自动使用本机 Python：${py}`
+      }
+    }
+  }
+
+  // ★ 错误自愈规则引擎：确定性环境故障自动修复，不浪费大模型推理
+  if (!result.ok) {
+    const stderr = String(result.stderr || result.error || '')
+    if (stderr) {
+      const matcher = ErrorPatternMatcher.getInstance()
+      const matched = matcher.match(stderr, command)
+      if (matched) {
+        if (matched.confidence >= 0.9) {
+          // 高置信度：自动执行修复脚本并重试原命令
+          const fixOut = matcher.runFix(matched, cwdPath, command)
+          const retry = await runOnce(command)
+          if (retry.ok) {
+            return { ...retry, note: `[错误自愈] ${matched.cause}，已自动修复` }
+          }
+          // 修复后仍失败：把修复输出附在结果里供模型参考
+          result = { ...retry, error: `[错误自愈尝试失败] ${matched.cause}\n修复输出: ${fixOut}\n原错误: ${retry.error || stderr}` }
+        } else if (matched.confidence >= 0.6) {
+          // 中置信度：把根因+修复建议作为上下文喂给大模型
+          const hint = matcher.getContextHint(matched)
+          result = { ...result, error: `${result.error}\n${hint}` }
+        }
       }
     }
   }

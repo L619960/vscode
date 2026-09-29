@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "description": "Agent 错误自愈规则库。stderr 正则匹配报错特征，cmdTags 匹配命令行上下文，置信度≥0.9 自动执行修复，0.6-0.89 作为上下文喂给模型。",
+  "patterns": [
+    {
+      "id": "electron-native-module-version-mismatch",
+      "regex": "was compiled against a different Node\\.js version|NODE_MODULE_VERSION",
+      "cmdTags": ["electron"],
+      "cause": "Electron 原生模块编译版本与当前 Electron 不匹配",
+      "confidence": 0.95,
+      "fixScript": "cd {{projectPath}}; if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }; if (Test-Path package-lock.json) { Remove-Item -Force package-lock.json }; $env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'; $env:ELECTRON_STRICT_SSL='false'; npm install",
+      "maxRetry": 1
+    },
+    {
+      "id": "electron-binary-tls-cert-error",
+      "regex": "unable to verify the first certificate|self-signed certificate in certificate chain",
+      "cmdTags": ["electron", "install.js"],
+      "cause": "Electron 二进制下载被企业代理/自签证书拦截",
+      "confidence": 0.93,
+      "fixScript": "cd {{projectPath}}; $env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'; $env:ELECTRON_STRICT_SSL='false'; $env:NODE_TLS_REJECT_UNAUTHORIZED='0'; if (Test-Path node_modules/electron/install.js) { node node_modules/electron/install.js } else { npm install electron --ignore-scripts; node node_modules/electron/install.js }",
+      "maxRetry": 1
+    },
+    {
+      "id": "electron-mirror-invalid-npm-config",
+      "regex": "electron_mirror.*is not a valid npm option",
+      "cmdTags": ["npm"],
+      "cause": "把 Electron 镜像写成了 npm 配置项，应该用环境变量",
+      "confidence": 0.98,
+      "fixScript": "npm config delete electron_mirror 2>$null; $env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'",
+      "maxRetry": 1
+    },
+    {
+      "id": "electron-binary-missing-after-install",
+      "regex": "dist\\\\electron\\.exe.*not found|Cannot find module.*electron.*dist",
+      "cmdTags": ["electron"],
+      "cause": "npm 安装时 postinstall 被拦截，Electron 二进制未下载",
+      "confidence": 0.9,
+      "fixScript": "cd {{projectPath}}; if (Test-Path node_modules/electron/install.js) { node node_modules/electron/install.js }",
+      "maxRetry": 1
+    },
+    {
+      "id": "windows-python-command-not-found",
+      "regex": "'python' 不是内部或外部命令|python: command not found|python : The term 'python' is not recognized",
+      "cmdTags": ["python"],
+      "cause": "Windows 系统 PATH 里只有 py 启动器，没有 python 命令",
+      "confidence": 0.92,
+      "fixScript": "{{originalCommand}}.Replace('python ', 'py ')",
+      "maxRetry": 1
+    },
+    {
+      "id": "gui-smoke-script-hangs",
+      "regex": "命令执行超过 30 秒已终止",
+      "cmdTags": ["python", ".py"],
+      "cause": "Python GUI 冒烟脚本末尾用 mainloop()/input() 挂起，未主动退出",
+      "confidence": 0.7,
+      "fixScript": "提示：GUI 冒烟脚本末尾必须用 root.after(毫秒, root.destroy) 自动销毁窗口，禁止用 mainloop()/input() 等待人工",
+      "maxRetry": 1
+    },
+    {
+      "id": "npm-ebadengine-node-version",
+      "regex": "EBADENGINE|Unsupported engine|node.*version.*required",
+      "cmdTags": ["npm", "install"],
+      "cause": "当前 Node 版本不满足依赖的 engines 要求",
+      "confidence": 0.8,
+      "fixScript": "node --version; npm --version",
+      "maxRetry": 1
+    }
+  ]
+}

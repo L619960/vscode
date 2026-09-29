@@ -41,9 +41,13 @@ if (Test-Path "$srcRoot\vendor") {
   Write-Host '  vendor/ 源目录不存在，跳过' -ForegroundColor Red
 }
 
-# 6. 同步 package.json 和媒体资源
+# 6. 同步 package.json、媒体资源和规则库
 Write-Host '[6/6] 同步 package.json 和媒体资源...' -ForegroundColor Yellow
 Copy-Item -Path "$srcRoot\package.json" -Destination $dstRoot -Force
+if (Test-Path "$srcRoot\error-patterns.json") {
+  Copy-Item -Path "$srcRoot\error-patterns.json" -Destination $dstRoot -Force
+  Write-Host '  error-patterns.json 已同步' -ForegroundColor Green
+}
 if (Test-Path "$srcRoot\media") {
   Copy-Item -Path "$srcRoot\media" -Destination $dstRoot -Recurse -Force
   Write-Host "  media/: $((Get-ChildItem "$dstRoot\media" -Recurse -File).Count) files" -ForegroundColor Green
