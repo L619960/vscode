@@ -16,7 +16,6 @@ import { execSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 
-const MAX_ROUNDS = 200
 /** 连续 LLM 错误上限：超过则终止任务，避免死循环 */
 const MAX_CONSECUTIVE_ERRORS = 3
 /** 连续空回复（无内容无工具调用）上限：空回复不终止，自动催办继续，超限才停止 */
@@ -507,8 +506,8 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
     let stagnantWarned = 0 // 停滞处置次数：第 1 次措辞催办，第 2 次宿主强制求真
     let stagnantTotal = 0 // 累计停滞轮数（措辞/求真后不归零），达 STAGNANT_HARD_LIMIT 熔断
     let deliveryRemindCount = 0 // 交付闸门拦截次数（冒烟通过后仍规划时强制汇报，最多 2 次）
-    let stoppedReason: 'maxRounds' | 'stagnant' = 'maxRounds'
-    for (let round = 1; round <= MAX_ROUNDS; round++) {
+    let stoppedReason: 'stagnant' | null = null
+    for (let round = 1; ; round++) {
       if (token.isCancellationRequested || abort.signal.aborted) return
 
       // 每轮开始前压缩一次历史，防止长任务中上下文无限膨胀
@@ -1218,12 +1217,6 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           '',
           '【当前状态】模型反复停留在读取/分析阶段，系统已分别尝试措辞催办与自动验证注入，仍未能继续推进。建议：发送「继续」并补充更具体的指示，或人工接手处理上述文件中可能存在的问题。',
         ].join('\n'),
-        time: deps.session.now(),
-      })
-    } else {
-      deps.session.add({
-        role: 'assistant',
-        content: `已达最大轮次（${MAX_ROUNDS}），已停止。可发送「继续」让 AI 接着执行。`,
         time: deps.session.now(),
       })
     }
