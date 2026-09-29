@@ -677,16 +677,31 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
       const matched = matcher.match(stderr, command)
       if (matched) {
         if (matched.confidence >= 0.9) {
-          // 高置信度：自动执行修复脚本并重试原命令
-          const fixOut = matcher.runFix(matched, cwdPath, command)
-          const retry = await runOnce(command)
-          if (retry.ok) {
-            return { ...retry, note: `[错误自愈] ${matched.cause}，已自动修复` }
+          if (matcher.hasPipeline(matched)) {
+            // ★ 修复管线：多步命令序列由框架独立执行，中间输出不喂模型，只返回摘要
+            const pipeResult = matcher.runPipeline(matched, cwdPath, command)
+            if (pipeResult.success) {
+              // 管线成功后重试原命令
+              const retry = await runOnce(command)
+              if (retry.ok) {
+                return { ...retry, note: `[错误自愈] ${matched.cause}，管线【${matched.pipeline!.name}】已自动修复` }
+              }
+              result = { ...retry, error: `[错误自愈管线成功但原命令仍失败] ${matched.cause}\n${pipeResult.summary}\n原错误: ${retry.error || stderr}` }
+            } else {
+              // 管线失败：把精简摘要（不含中间大段日志）附给模型
+              const stepLines = pipeResult.steps.map((s, i) => `  ${i + 1}. ${s.ok ? '✅' : '❌'} ${s.command.slice(0, 80)}${s.output ? ' — ' + s.output.replace(/\n/g, ' ').slice(0, 100) : ''}`).join('\n')
+              result = { ...result, error: `[错误自愈管线未解决] ${matched.cause}\n${pipeResult.summary}\n步骤:\n${stepLines}\n原错误: ${result.error || stderr}` }
+            }
+          } else {
+            // 单脚本修复
+            const fixOut = matcher.runFix(matched, cwdPath, command)
+            const retry = await runOnce(command)
+            if (retry.ok) {
+              return { ...retry, note: `[错误自愈] ${matched.cause}，已自动修复` }
+            }
+            result = { ...retry, error: `[错误自愈尝试失败] ${matched.cause}\n修复输出: ${fixOut}\n原错误: ${retry.error || stderr}` }
           }
-          // 修复后仍失败：把修复输出附在结果里供模型参考
-          result = { ...retry, error: `[错误自愈尝试失败] ${matched.cause}\n修复输出: ${fixOut}\n原错误: ${retry.error || stderr}` }
         } else if (matched.confidence >= 0.6) {
-          // 中置信度：把根因+修复建议作为上下文喂给大模型
           const hint = matcher.getContextHint(matched)
           result = { ...result, error: `${result.error}\n${hint}` }
         }

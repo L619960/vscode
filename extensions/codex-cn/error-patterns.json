@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "description": "Agent 错误自愈规则库。stderr 正则匹配报错特征，cmdTags 匹配命令行上下文（命中任一即可），置信度≥0.9 自动执行修复，0.6-0.89 作为上下文喂给模型。镜像统一用 registry.npmmirror.com（npmmirror.com 主域名在部分网络 DNS 解析失败）。",
+  "version": 3,
+  "description": "Agent 错误自愈规则库。stderr 正则匹配报错特征，cmdTags 匹配命令行上下文（命中任一即可），置信度≥0.9 自动执行修复，0.6-0.89 作为上下文喂给模型。镜像统一用 registry.npmmirror.com（npmmirror.com 主域名在部分网络 DNS 解析失败）。支持 pipeline 多步修复管线（优先于 fixScript）。",
   "patterns": [
     {
       "id": "electron-binary-download-failed",
@@ -9,6 +9,23 @@
       "cause": "Electron 二进制下载被网络环境拦截（企业代理/自签证书/DNS 污染），需用国内镜像",
       "confidence": 0.93,
       "fixScript": "cd {{projectPath}}; $env:ELECTRON_MIRROR='https://registry.npmmirror.com/-/binary/electron/'; $env:ELECTRON_STRICT_SSL='false'; $env:NODE_TLS_REJECT_UNAUTHORIZED='0'; node --use-system-ca node_modules/electron/install.js",
+      "pipeline": {
+        "name": "electron-mirror-install",
+        "steps": [
+          {
+            "command": "if (Test-Path node_modules/electron) { Remove-Item -Recurse -Force node_modules/electron }; npm install electron --ignore-scripts --force",
+            "success": { "fileExists": "{{projectPath}}/node_modules/electron/install.js" },
+            "onSuccess": "next",
+            "onFail": "end_fail"
+          },
+          {
+            "command": "$env:ELECTRON_MIRROR='https://registry.npmmirror.com/-/binary/electron/'; $env:ELECTRON_STRICT_SSL='false'; $env:NODE_TLS_REJECT_UNAUTHORIZED='0'; node --use-system-ca node_modules/electron/install.js",
+            "success": { "fileExists": "{{projectPath}}/node_modules/electron/dist/electron.exe" },
+            "onSuccess": "end_success",
+            "onFail": "retry"
+          }
+        ]
+      },
       "maxRetry": 3
     },
     {
