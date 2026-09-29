@@ -6,6 +6,7 @@ import { getLLMConfig } from './config.js'
 import { TOOL_SCHEMAS, CORE_TOOL_SCHEMAS, WRITE_TOOLS, READ_TOOLS, summarizeArgs, summarizeResult, wantsBrowser } from './tools.js'
 import { executeToolCall, type ApprovalDecision, type ApprovalRequest, type ExecHooks, type ToolDeps } from './executor.js'
 import { ErrorPatternMatcher } from './errorPatternMatcher.js'
+import { repairJson, extractFirstCodeBlock } from './jsonRepair.js'
 import { SubAgentManager } from './subAgent.js'
 import { buildSystemPrompt } from './prompt.js'
 import { Session, type SessionMessage, type ToolRun } from './session.js'
@@ -798,8 +799,38 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
 
           let args: Record<string, unknown> = {}
           let argsParseError = ''
-          try { args = JSON.parse(call.function.arguments || '{}') } catch (e) {
-            argsParseError = `工具参数 JSON 解析失败: ${(e as Error).message}。原始参数: ${(call.function.arguments || '').slice(0, 200)}`
+          const rawArgs = call.function.arguments || '{}'
+          try {
+            args = JSON.parse(rawArgs)
+          } catch (e) {
+            // 弱模型常把大段代码（未转义引号/换行）塞进 JSON 字符串，导致解析失败。
+            // 尝试容错修复：状态机转义字符串内的非法字符。
+            const repaired = repairJson(rawArgs)
+            if (repaired) {
+              try {
+                args = JSON.parse(repaired)
+                // 同步回 call，让执行器 parseArgs 直接拿到修复后的参数
+                call.function.arguments = repaired
+              } catch {
+                argsParseError = `工具参数 JSON 解析失败（修复后仍失败）: ${(e as Error).message}。原始参数前200字符: ${rawArgs.slice(0, 200)}`
+              }
+            } else {
+              argsParseError = `工具参数 JSON 解析失败: ${(e as Error).message}。原始参数前200字符: ${rawArgs.slice(0, 200)}`
+            }
+          }
+          // ★ write_file/edit_file content 回退：参数解析成功但 content 缺失/为空时，
+          // 从 assistant 消息文本的 ``` 代码块提取内容（弱模型常把代码放在消息正文而非参数里）
+          const tname0 = call.function.name
+          if (!argsParseError && (tname0 === 'write_file' || tname0 === 'edit_file')) {
+            const hasContent = typeof args.content === 'string' && args.content.trim().length > 0
+            if (!hasContent && result.content) {
+              const block = extractFirstCodeBlock(result.content)
+              if (block && block.content.trim().length > 0) {
+                args = { ...args, content: block.content }
+                // 同步回 call，让执行器 parseArgs 拿到正确参数
+                call.function.arguments = JSON.stringify(args)
+              }
+            }
           }
           run = {
             id: call.id,

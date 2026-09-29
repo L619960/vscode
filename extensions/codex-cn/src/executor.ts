@@ -11,6 +11,7 @@ import { getAgentSettings } from './config.js'
 import { saveCheckpoint } from './checkpoints.js'
 import { webSearch } from './webSearch.js'
 import { ErrorPatternMatcher } from './errorPatternMatcher.js'
+import { repairJson } from './jsonRepair.js'
 import type { TaskBoard, TaskCheckpoint } from './taskBoard.js'
 import type { BackgroundShell } from './backgroundShell.js'
 import type { BrowserSession } from './browser.js'
@@ -177,8 +178,16 @@ async function readText(uri: vscode.Uri): Promise<string> {
 }
 
 function parseArgs(call: ToolCall): Record<string, any> {
-  try { return call.function.arguments ? JSON.parse(call.function.arguments) : {} }
-  catch { return {} }
+  const raw = call.function.arguments || '{}'
+  try { return JSON.parse(raw) }
+  catch {
+    // 容错修复：弱模型常把未转义的代码塞进 JSON 字符串
+    const repaired = repairJson(raw)
+    if (repaired) {
+      try { return JSON.parse(repaired) } catch { /* fall through */ }
+    }
+    return {}
+  }
 }
 
 // ---- 读类 ----
