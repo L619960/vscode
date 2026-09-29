@@ -573,7 +573,9 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
     try {
       const { stdout: rawOut, stderr: rawErr } = await execPromise(`chcp 65001 >nul && ${cmd}`, {
         cwd: cwdPath, timeout: 30000, maxBuffer: 10 * 1024 * 1024, windowsHide: true,
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+        // 清除 ELECTRON_RUN_AS_NODE：扩展宿主进程自身设了此变量，会污染子进程
+        // 导致 electron 退化为纯 Node 模式，require('electron') 返回路径字符串而非 API 对象
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
       })
       const stdout = String(rawOut || '')
       const stderr = String(rawErr || '')
