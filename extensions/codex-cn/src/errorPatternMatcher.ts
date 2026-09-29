@@ -13,8 +13,8 @@
  * - 管线结束只返回精简摘要，避免模型被大量失败重试日志干扰
  */
 
-import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { join, dirname } from 'node:path'
 import { execSync } from 'node:child_process'
 
 /** 把命令编码为 PowerShell -EncodedCommand 所需的 UTF-16LE base64，彻底避免引号转义问题 */
@@ -77,6 +77,10 @@ export interface ErrorPattern {
   pipeline?: RepairPipeline
   /** 单会话内最大触发次数，防死循环 */
   maxRetry: number
+  /** 自动学习生成的规则（需人工审核后才提升置信度） */
+  autoLearned?: boolean
+  /** 是否需要人工审核（autoLearned 默认 true） */
+  needsReview?: boolean
 }
 
 /** 管线执行结果 */
@@ -95,13 +99,18 @@ interface RuleLibrary {
 
 /** 规则库路径：扩展根目录下的 error-patterns.json */
 const RULE_FILE = join(__dirname, '..', 'error-patterns.json')
+/** 项目级学习规则路径（相对项目根） */
+const LEARNED_REL = '.agent/error-knowledge.json'
 
 /** 单例缓存 */
 let instance: ErrorPatternMatcher | null = null
 
 export class ErrorPatternMatcher {
   private patterns: ErrorPattern[] = []
+  private learnedPatterns: ErrorPattern[] = []
   private triggerCount: Record<string, number> = {}
+  /** 当前加载的项目路径，用于 deposit 时定位写入位置 */
+  private currentProjectPath: string | null = null
 
   private constructor() {
     this.load()
@@ -113,7 +122,7 @@ export class ErrorPatternMatcher {
     return instance
   }
 
-  /** 加载规则库 */
+  /** 加载内置规则库 */
   private load(): void {
     try {
       if (!existsSync(RULE_FILE)) {
@@ -129,27 +138,112 @@ export class ErrorPatternMatcher {
   }
 
   /**
-   * 匹配错误日志
+   * 加载项目级学习规则（会话开始时调用一次）
+   * autoLearned 且 needsReview 的规则置信度强制 0.7（只喂上下文，不自动执行）
+   */
+  loadLearned(projectPath: string): void {
+    this.currentProjectPath = projectPath
+    this.learnedPatterns = []
+    try {
+      const file = join(projectPath, LEARNED_REL)
+      if (!existsSync(file)) return
+      const lib = JSON.parse(readFileSync(file, 'utf-8')) as RuleLibrary
+      this.learnedPatterns = (lib.patterns || []).map(p => ({
+        ...p,
+        autoLearned: true,
+        needsReview: p.needsReview !== false,
+        // 未审核的学习规则只喂上下文，不自动执行
+        confidence: p.needsReview !== false ? Math.min(p.confidence ?? 0.7, 0.7) : p.confidence,
+      }))
+    } catch (e) {
+      console.error('[ErrorPatternMatcher] 项目学习规则加载失败:', e)
+      this.learnedPatterns = []
+    }
+  }
+
+  /**
+   * 匹配错误日志（先内置规则，再项目学习规则）
    */
   match(stderr: string, cmd: string): ErrorPattern | null {
-    if (!stderr || !this.patterns.length) return null
+    if (!stderr) return null
     const lowerCmd = cmd.toLowerCase()
 
-    for (const pattern of this.patterns) {
-      const hasTag = pattern.cmdTags.some(tag => lowerCmd.includes(tag.toLowerCase()))
-      if (!hasTag) continue
-
-      try {
-        const regex = new RegExp(pattern.regex, 'i')
-        if (regex.test(stderr)) {
-          if ((this.triggerCount[pattern.id] || 0) >= pattern.maxRetry) continue
-          return pattern
+    const matchIn = (list: ErrorPattern[]): ErrorPattern | null => {
+      for (const pattern of list) {
+        // cmdTags 为空表示匹配任何命令；否则需命中至少一个标签
+        const hasTag = pattern.cmdTags.length === 0
+          || pattern.cmdTags.some(tag => lowerCmd.includes(tag.toLowerCase()))
+        if (!hasTag) continue
+        try {
+          const regex = new RegExp(pattern.regex, 'i')
+          if (regex.test(stderr)) {
+            if ((this.triggerCount[pattern.id] || 0) >= pattern.maxRetry) continue
+            return pattern
+          }
+        } catch {
+          continue
         }
-      } catch {
-        continue
       }
+      return null
     }
-    return null
+
+    // 内置规则优先
+    const builtin = matchIn(this.patterns)
+    if (builtin) return builtin
+    // 再匹配项目学习规则
+    return matchIn(this.learnedPatterns)
+  }
+
+  /**
+   * 沉淀一条自动学习的候选规则到项目级 error-knowledge.json
+   * 置信度固定 0.7（需人工审核后才自动执行），避免错误修复被复用
+   */
+  depositCandidate(stderr: string, cmd: string, fixDescription: string, projectPath?: string): ErrorPattern | null {
+    const target = projectPath || this.currentProjectPath
+    if (!target) return null
+
+    // 提取核心报错行作为正则（取最后一行非空内容，比首行更接近根因）
+    const lines = stderr.split('\n').filter(l => l.trim())
+    const coreError = lines.length > 0 ? lines[lines.length - 1].trim().slice(0, 150) : stderr.slice(0, 150)
+    if (!coreError) return null
+    const escaped = coreError.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+    // 从命令提取上下文标签
+    const cmdTags = cmd.toLowerCase().includes('electron') ? ['electron']
+      : cmd.toLowerCase().includes('npm') ? ['npm']
+        : cmd.toLowerCase().includes('python') || cmd.toLowerCase().includes('py ') ? ['python']
+          : []
+
+    const candidate: ErrorPattern = {
+      id: `learned-${Date.now()}`,
+      regex: escaped,
+      cmdTags,
+      cause: `自动学习：模型成功修复此报错。建议修复：${fixDescription}`,
+      confidence: 0.7,
+      fixScript: `# 由模型成功修复后自动沉淀，需人工审核。建议：${fixDescription}`,
+      maxRetry: 2,
+      autoLearned: true,
+      needsReview: true,
+    }
+
+    try {
+      const file = join(target, LEARNED_REL)
+      mkdirSync(dirname(file), { recursive: true })
+      let existing: ErrorPattern[] = []
+      if (existsSync(file)) {
+        existing = JSON.parse(readFileSync(file, 'utf-8')).patterns || []
+      }
+      // 去重：同 regex 不重复沉淀
+      if (existing.some(p => p.regex === candidate.regex)) return candidate
+      existing.push(candidate)
+      writeFileSync(file, JSON.stringify({ version: 1, patterns: existing }, null, 2), 'utf-8')
+      // 同步到内存
+      this.learnedPatterns.push(candidate)
+      return candidate
+    } catch (e) {
+      console.error('[ErrorPatternMatcher] 沉淀学习规则失败:', e)
+      return null
+    }
   }
 
   /**

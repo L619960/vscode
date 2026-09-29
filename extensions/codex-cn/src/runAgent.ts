@@ -5,6 +5,7 @@ import { chatCompletion } from './llm.js'
 import { getLLMConfig } from './config.js'
 import { TOOL_SCHEMAS, CORE_TOOL_SCHEMAS, WRITE_TOOLS, READ_TOOLS, summarizeArgs, summarizeResult, wantsBrowser } from './tools.js'
 import { executeToolCall, type ApprovalDecision, type ApprovalRequest, type ExecHooks, type ToolDeps } from './executor.js'
+import { ErrorPatternMatcher } from './errorPatternMatcher.js'
 import { SubAgentManager } from './subAgent.js'
 import { buildSystemPrompt } from './prompt.js'
 import { Session, type SessionMessage, type ToolRun } from './session.js'
@@ -450,6 +451,11 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
   const normPath = (p: unknown): string => String(p || '').replace(/\//g, '\\').toLowerCase()
   const readPaths = new Set<string>()
   const modifiedPaths = new Set<string>()
+  // ★ 错误记忆沉淀：追踪"未匹配错误 → 模型编辑修复 → 验证成功"链路
+  // pendingLearn 记录最近一次未被规则引擎匹配的命令错误；模型编辑后若验证成功则沉淀为学习规则
+  let pendingLearn: { stderr: string; cmd: string; fixFiles: Set<string> } | null = null
+  const projectRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  if (projectRoot) ErrorPatternMatcher.getInstance().loadLearned(projectRoot)
   let lastVerifyRound = 0   // 最近一次验证类工具（run_command / read_lints / await_shell）成功所在轮
   let lastModifyRound = 0   // 最近一次写类工具成功所在轮
   let verifyRemindCount = 0 // 验证闸门拦截次数：允许拦截 2 次，第 3 次放行防死循环
@@ -1123,6 +1129,28 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           if (tname === 'todo_write' || tname === 'submit_plan' || tname === 'load_skill'
             || tname === 'read_file' || tname === 'search_files' || tname === 'list_dir' || tname === 'read_lints') {
             roundHadProgress = true
+          }
+          // ★ 错误记忆沉淀：追踪"未匹配错误 → 模型编辑 → 验证成功"链路
+          const errStr = String(toolResult.error || '')
+          if (tname === 'run_command' && !toolResult.ok && !errStr.includes('[错误自愈')) {
+            // 命令失败且未被规则引擎处理 → 记录待学习的错误
+            const cmd = String(args.command || '')
+            pendingLearn = { stderr: errStr.slice(0, 2000), cmd, fixFiles: new Set() }
+          } else if (toolResult.ok && pendingLearn) {
+            if (tname === 'write_file' || tname === 'edit_file') {
+              // 模型在错误后编辑了文件 → 计入修复步骤
+              pendingLearn.fixFiles.add(normPath(args.path))
+            } else if ((tname === 'run_command' || tname === 'await_shell') && pendingLearn.fixFiles.size > 0) {
+              // 编辑后命令验证成功 → 沉淀学习规则
+              const fixDesc = `修改文件 ${[...pendingLearn.fixFiles].join('、')} 后重新执行 ${pendingLearn.cmd.split('\n')[0].slice(0, 60)}`
+              const learned = ErrorPatternMatcher.getInstance().depositCandidate(
+                pendingLearn.stderr, pendingLearn.cmd, fixDesc, projectRoot
+              )
+              if (learned) {
+                run.resultSummary = `${run.resultSummary}（已沉淀错误修复经验，下次同类报错可参考）`
+              }
+              pendingLearn = null
+            }
           }
           deps.session.save()
           deps.onChange()
