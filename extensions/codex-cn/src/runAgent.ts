@@ -33,9 +33,11 @@ const STAGNANT_HARD_LIMIT_NO_PRODUCT = 40
  * 宿主侧强制执行命令（不经过模型决策、不走审批），拿物理现实的真实结果。
  * 用于"分析瘫痪"时宿主替模型完成验证（ctrl-alt-pray 的 ground-truth 思路）。
  */
-function hostExec(command: string, cwd: string, timeoutMs = 30000): { ok: boolean; output: string; exitCode: number } {
+function hostExec(command: string, cwd: string, timeoutMs = 0): { ok: boolean; output: string; exitCode: number } {
   try {
-    const stdout = execSync(command, { cwd, timeout: timeoutMs, encoding: 'utf-8', windowsHide: true })
+    const opts: { cwd: string; encoding: 'utf-8'; windowsHide: boolean; timeout?: number } = { cwd, encoding: 'utf-8', windowsHide: true }
+    if (timeoutMs > 0) opts.timeout = timeoutMs
+    const stdout = execSync(command, opts)
     return { ok: true, output: stdout.trimEnd(), exitCode: 0 }
   } catch (e) {
     const err = e as { stdout?: string; stderr?: string; status?: number; message?: string }
@@ -332,10 +334,10 @@ function truncateToolResult(_name: string, result: Record<string, unknown>): Rec
   return out
 }
 
-/** 单个工具执行超时（毫秒） */
-const TOOL_TIMEOUT_MS = 30000
+/** 工具执行超时：用户要求不限制时长，设为 0 表示无超时 */
+const TOOL_TIMEOUT_MS = 0
 /** install 类命令需要下载大量文件（electron 二进制 100MB+），放宽到 3 分钟 */
-const INSTALL_TIMEOUT_MS = 180000
+const INSTALL_TIMEOUT_MS = 0
 const INSTALL_CMD_RE = /\b(npm|pnpm|yarn)\s+(install|i|ci)\b|\bpip3?\s+install\b|\bpy\s+-m\s+pip\b/i
 
 /** 带超时执行工具：超时返回错误结果而不是挂死主循环。
@@ -346,12 +348,16 @@ async function executeToolWithTimeout(call: ToolCall, hooks: ExecHooks, deps: To
   if (n === 'run_command' || n === 'await_shell') {
     try { cmdArg = String(JSON.parse(String((call.function as { arguments?: string } | undefined)?.arguments || '{}')).command || '') } catch { /* 参数解析失败按普通命令处理 */ }
   }
-  const limit = n === 'await_shell' ? 70000
-    : n.startsWith('browser_') ? 50000
+  const limit = n === 'await_shell' ? 0
+    : n.startsWith('browser_') ? 0
       : n === 'run_command' && INSTALL_CMD_RE.test(cmdArg) ? INSTALL_TIMEOUT_MS
         : TOOL_TIMEOUT_MS
+  // 无超时：直接执行，不设置定时器
+  if (limit === 0) {
+    return await executeToolCall(call, hooks, deps)
+  }
   let timer: ReturnType<typeof setTimeout> | undefined
-  let remaining = limit
+  let remaining: number = limit
   let stageStart = Date.now()
   let raceResolve: (v: Record<string, unknown>) => void = () => { }
   const timeoutP = new Promise<Record<string, unknown>>((resolve) => {

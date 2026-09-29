@@ -61,7 +61,7 @@ function pythonViaPyLauncher(): string | null {
   try {
     const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
     const out = execFileSync('py', ['-c', 'import sys;sys.stdout.buffer.write(sys.executable.encode("utf-8"))'], {
-      windowsHide: true, encoding: 'buffer', timeout: 8000,
+      windowsHide: true, encoding: 'buffer',
       env: { ...process.env, PYTHONUTF8: '1' },
     }) as Buffer
     const py = new TextDecoder('utf-8').decode(out).trim()
@@ -347,7 +347,7 @@ async function execWebFetch(call: ToolCall): Promise<Record<string, unknown>> {
   if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'web_fetch 的 url 必须是 http(s) 地址' }
   try {
     const resp = await fetch(url, {
-      redirect: 'follow', signal: AbortSignal.timeout(15000),
+      redirect: 'follow',
       headers: { 'User-Agent': 'Mozilla/5.0 CodexCN' },
     })
     const ctype = resp.headers.get('content-type') || ''
@@ -631,11 +631,10 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
     // 剥反引号：cmd.exe 里反引号不是特殊字符，模型常把 PowerShell 的 `URL` 语法
     // 带进来导致环境变量值被反引号污染（如 ELECTRON_MIRROR=`https://...`），镜像失效
     const cmd = rawCmd.replace(/`/g, '')
-    // npm/pip install 需下载大量文件，30 秒不够（electron 二进制 100MB+）
-    const isInstall = /\b(npm|pnpm|yarn)\s+(install|i|ci)\b|\bpip3?\s+install\b|\bpy\s+-m\s+pip\b/i.test(cmd)
     try {
+      // 用户要求不限制命令执行时长，移除 timeout 参数
       const { stdout: rawOut, stderr: rawErr } = await execPromise(`chcp 65001 >nul && ${cmd}`, {
-        cwd: cwdPath, timeout: isInstall ? 180000 : 30000, maxBuffer: 10 * 1024 * 1024, windowsHide: true,
+        cwd: cwdPath, maxBuffer: 10 * 1024 * 1024, windowsHide: true,
         // 清除 ELECTRON_RUN_AS_NODE：扩展宿主进程自身设了此变量，会污染子进程
         // 导致 electron 退化为纯 Node 模式，require('electron') 返回路径字符串而非 API 对象
         env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
@@ -645,11 +644,11 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
       return { ok: true, code: 0, stdout, stderr }
     } catch (e: any) {
       if (e.killed && e.signal === 'SIGTERM') {
-        // Python 脚本超时：极常见根因是 GUI 冒烟脚本末尾 mainloop() 挂起等待人工
+        // Python 脚本被终止：极常见根因是 GUI 冒烟脚本末尾 mainloop() 挂起等待人工
         const guiHint = /^python3?(\.exe)?\s+\S+\.py/i.test(cmd)
           ? '——若这是 GUI 冒烟脚本，禁止用 mainloop()/input() 挂起等待人工：脚本末尾必须用 root.after(毫秒, root.destroy) 安排自动销毁，让窗口弹出后自行退出'
           : ''
-        return { ok: false, error: `命令执行超过 ${(isInstall ? 180000 : 30000) / 1000} 秒已终止${guiHint}` }
+        return { ok: false, error: `命令被外部终止${guiHint}` }
       }
       // exec 在非零退出码时 reject，stderr/stdout 在 e 上
       if (typeof e.code === 'number') {
@@ -747,7 +746,8 @@ async function execAwaitShell(call: ToolCall, hooks: ExecHooks, deps: ToolDeps):
     }
     case 'wait': {
       if (!args.id) return { ok: false, error: 'wait 缺少 id' }
-      const timeout = Math.min(Number(args.timeout) || 30000, 60000)
+      // 用户要求不限制时长，移除上限限制
+      const timeout = Number(args.timeout) || 0
       return { action: 'wait', ...await deps.bgShell.wait(String(args.id), timeout) }
     }
     case 'stop': {
