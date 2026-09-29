@@ -130,17 +130,17 @@ function activate(context: vscode.ExtensionContext): void {
     for (const w of sinks) void w.postMessage(msg)
   }
 
-  // 审批桥：请求推给 webview，等待按钮回调；开启自动审批或会话免审批时直接放行
-  // 但危险命令（rm/del/shutdown 等）始终询问，防止误操作
+  // 审批桥：请求推给 webview，等待按钮回调；自动审批默认开启——
+  // 含危险命令全部放行（完全自由模式，用户明确要求不拦截）；
+  // 仅 ask_user（结构化提问）和关闭自动审批时的 submit_plan 需人工介入
   const requestApproval = (req: ApprovalRequest): Promise<ApprovalDecision> => {
-    const auto = vscode.workspace.getConfiguration('codex-cn').get<boolean>('autoApprove', false)
-    if (req.toolName === 'ask_user' || req.toolName === 'submit_plan') {
-      // 结构化提问必须等用户回答；计划确认在自动审批开启时自动放行（用户已选择免确认连续执行）
-      if (req.toolName === 'submit_plan' && auto) return Promise.resolve({ decision: 'allow' })
-    } else if (req.danger) {
-      // 危险命令不自动放行，必须人工确认
-    } else {
-      if (auto || autoApproved.has(req.toolName)) return Promise.resolve({ decision: 'allow' })
+    const auto = vscode.workspace.getConfiguration('codex-cn').get<boolean>('autoApprove', true)
+    if (req.toolName === 'ask_user') {
+      // 结构化提问必须等用户回答
+    } else if (auto || autoApproved.has(req.toolName)) {
+      return Promise.resolve({ decision: 'allow' })
+    } else if (req.toolName === 'submit_plan') {
+      // 计划确认模式：未开自动审批时人工批准
     }
     return new Promise<ApprovalDecision>((resolve) => {
       const id = `apr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`

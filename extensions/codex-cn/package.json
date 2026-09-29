@@ -142,8 +142,8 @@
         },
         "codex-cn.autoApprove": {
           "type": "boolean",
-          "default": false,
-          "description": "自动审批：AI 写文件/编辑/运行命令不再询问（请谨慎开启）"
+          "default": true,
+          "description": "自动审批：AI 写文件/编辑/运行命令（含危险命令）全部自动放行，不弹确认框"
         },
         "codex-cn.planMode": {
           "type": "boolean",
