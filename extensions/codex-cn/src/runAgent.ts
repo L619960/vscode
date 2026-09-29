@@ -23,8 +23,10 @@ const MAX_CONSECUTIVE_ERRORS = 3
 const MAX_EMPTY_RESPONSES = 3
 /** 同一任务内退化循环熔断上限：连续触发即终止任务 */
 const MAX_LOOP_TRIPS = 2
-/** 停滞硬上限：累计无进展轮次达此值即强制终止（措辞催办+宿主求真均无效的兜底） */
-const STAGNANT_HARD_LIMIT = 6
+/** 停滞硬上限：有产物后连续无进展轮次达此值即熔断（有产物还不验证=真瘫痪） */
+const STAGNANT_HARD_LIMIT_WITH_PRODUCT = 6
+/** 无产物阶段的硬上限：强模型前期规划/探索需要空间，过紧会误杀合理规划阶段 */
+const STAGNANT_HARD_LIMIT_NO_PRODUCT = 12
 
 /**
  * 宿主侧强制执行命令（不经过模型决策、不走审批），拿物理现实的真实结果。
@@ -1165,6 +1167,12 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           }
           // 执行了命令（即使失败）也算在行动，不算分析瘫痪
           if (tname === 'run_command' || tname === 'await_shell') roundHadProgress = true
+          // 规划与探索类工具本身是有价值的推进（强模型前期会充分规划后才动手），
+          // 不应被计为"零进展"而触发分析瘫痪误判
+          if (tname === 'todo_write' || tname === 'submit_plan' || tname === 'load_skill'
+            || tname === 'read_file' || tname === 'search_files' || tname === 'list_dir' || tname === 'read_lints') {
+            roundHadProgress = true
+          }
           deps.session.save()
           deps.onChange()
 
@@ -1182,12 +1190,14 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           deps.onChange()
         }
       }
-      // 本轮有修改/命令执行则清零停滞计数；全是只读/规划/被拦则累积
+      // 本轮有修改/命令执行/规划/探索则清零停滞计数；全空转（空回复/被拦/退化循环）则累积
       stagnantActionRounds = roundHadProgress ? 0 : stagnantActionRounds + 1
       stagnantTotal = roundHadProgress ? 0 : stagnantTotal + 1
       deps.session.save()
       // Level 3：措辞催办与宿主求真均未带来进展，硬上限熔断，避免无限烧时间
-      if (stagnantTotal >= STAGNANT_HARD_LIMIT) {
+      // 无产物阶段用更宽松的阈值（强模型前期规划合理），有产物后用紧阈值（不验证=真瘫痪）
+      const hardLimit = modifiedPaths.size > 0 ? STAGNANT_HARD_LIMIT_WITH_PRODUCT : STAGNANT_HARD_LIMIT_NO_PRODUCT
+      if (stagnantTotal >= hardLimit) {
         stoppedReason = 'stagnant'
         break
       }
