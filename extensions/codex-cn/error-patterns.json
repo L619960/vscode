@@ -1,42 +1,51 @@
 {
-  "version": 1,
-  "description": "Agent 错误自愈规则库。stderr 正则匹配报错特征，cmdTags 匹配命令行上下文，置信度≥0.9 自动执行修复，0.6-0.89 作为上下文喂给模型。",
+  "version": 2,
+  "description": "Agent 错误自愈规则库。stderr 正则匹配报错特征，cmdTags 匹配命令行上下文（命中任一即可），置信度≥0.9 自动执行修复，0.6-0.89 作为上下文喂给模型。镜像统一用 registry.npmmirror.com（npmmirror.com 主域名在部分网络 DNS 解析失败）。",
   "patterns": [
     {
-      "id": "electron-native-module-version-mismatch",
-      "regex": "was compiled against a different Node\\.js version|NODE_MODULE_VERSION",
+      "id": "electron-binary-download-failed",
+      "regex": "unable to verify the first certificate|self-signed certificate in certificate chain|TypeError: fetch failed|getaddrinfo ENOTFOUND|ECONNREFUSED|ETIMEDOUT",
       "cmdTags": ["electron"],
-      "cause": "Electron 原生模块编译版本与当前 Electron 不匹配",
-      "confidence": 0.95,
-      "fixScript": "cd {{projectPath}}; if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }; if (Test-Path package-lock.json) { Remove-Item -Force package-lock.json }; $env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'; $env:ELECTRON_STRICT_SSL='false'; npm install",
-      "maxRetry": 1
+      "cause": "Electron 二进制下载被网络环境拦截（企业代理/自签证书/DNS 污染），需用国内镜像",
+      "confidence": 0.93,
+      "fixScript": "cd {{projectPath}}; $env:ELECTRON_MIRROR='https://registry.npmmirror.com/-/binary/electron/'; $env:ELECTRON_STRICT_SSL='false'; $env:NODE_TLS_REJECT_UNAUTHORIZED='0'; node --use-system-ca node_modules/electron/install.js",
+      "maxRetry": 3
     },
     {
-      "id": "electron-binary-tls-cert-error",
-      "regex": "unable to verify the first certificate|self-signed certificate in certificate chain",
-      "cmdTags": ["electron", "install.js"],
-      "cause": "Electron 二进制下载被企业代理/自签证书拦截",
-      "confidence": 0.93,
-      "fixScript": "cd {{projectPath}}; $env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'; $env:ELECTRON_STRICT_SSL='false'; $env:NODE_TLS_REJECT_UNAUTHORIZED='0'; if (Test-Path node_modules/electron/install.js) { node node_modules/electron/install.js } else { npm install electron --ignore-scripts; node node_modules/electron/install.js }",
-      "maxRetry": 1
+      "id": "electron-postinstall-swallowed",
+      "regex": "npm error code 1|npm error command failed|command node install\\.js",
+      "cmdTags": ["electron"],
+      "cause": "npm install electron 的 postinstall 下载二进制失败（真实报错被 npm 收进日志文件，stderr 首行只有无关警告）",
+      "confidence": 0.9,
+      "fixScript": "cd {{projectPath}}; $env:ELECTRON_MIRROR='https://registry.npmmirror.com/-/binary/electron/'; $env:ELECTRON_STRICT_SSL='false'; $env:NODE_TLS_REJECT_UNAUTHORIZED='0'; npm install electron --ignore-scripts --force; node --use-system-ca node_modules/electron/install.js",
+      "maxRetry": 3
+    },
+    {
+      "id": "electron-binary-missing-after-install",
+      "regex": "dist\\\\electron\\.exe.*not found|Cannot find module.*electron.*dist|no dist",
+      "cmdTags": ["electron"],
+      "cause": "electron 包已安装但二进制缺失（postinstall 被跳过或下载失败）",
+      "confidence": 0.9,
+      "fixScript": "cd {{projectPath}}; $env:ELECTRON_MIRROR='https://registry.npmmirror.com/-/binary/electron/'; $env:ELECTRON_STRICT_SSL='false'; $env:NODE_TLS_REJECT_UNAUTHORIZED='0'; if (Test-Path node_modules/electron/install.js) { node --use-system-ca node_modules/electron/install.js } else { npm install electron --ignore-scripts --force; node --use-system-ca node_modules/electron/install.js }",
+      "maxRetry": 3
     },
     {
       "id": "electron-mirror-invalid-npm-config",
       "regex": "electron_mirror.*is not a valid npm option",
       "cmdTags": ["npm"],
-      "cause": "把 Electron 镜像写成了 npm 配置项，应该用环境变量",
-      "confidence": 0.98,
-      "fixScript": "npm config delete electron_mirror 2>$null; $env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'",
-      "maxRetry": 1
+      "cause": "把 Electron 镜像写成了 npm 配置项——npm 不认识这个配置，必须用环境变量 ELECTRON_MIRROR。且当前是 cmd.exe：用 `set ELECTRON_MIRROR=https://registry.npmmirror.com/-/binary/electron/`（不要加反引号或引号）",
+      "confidence": 0.7,
+      "fixScript": "npm config delete electron_mirror 2>$null",
+      "maxRetry": 3
     },
     {
-      "id": "electron-binary-missing-after-install",
-      "regex": "dist\\\\electron\\.exe.*not found|Cannot find module.*electron.*dist",
-      "cmdTags": ["electron"],
-      "cause": "npm 安装时 postinstall 被拦截，Electron 二进制未下载",
-      "confidence": 0.9,
-      "fixScript": "cd {{projectPath}}; if (Test-Path node_modules/electron/install.js) { node node_modules/electron/install.js }",
-      "maxRetry": 1
+      "id": "npm-etarget-version-not-found",
+      "regex": "ETARGET|No matching version found",
+      "cmdTags": ["npm"],
+      "cause": "指定的包版本不存在。先用 `npm view <pkg> versions --json` 查询可用版本列表再选择",
+      "confidence": 0.7,
+      "fixScript": "npm view electron versions --json",
+      "maxRetry": 2
     },
     {
       "id": "windows-python-command-not-found",
@@ -45,25 +54,25 @@
       "cause": "Windows 系统 PATH 里只有 py 启动器，没有 python 命令",
       "confidence": 0.92,
       "fixScript": "{{originalCommand}}.Replace('python ', 'py ')",
-      "maxRetry": 1
+      "maxRetry": 3
     },
     {
       "id": "gui-smoke-script-hangs",
-      "regex": "命令执行超过 30 秒已终止",
+      "regex": "命令执行超过 30 秒已终止|工具执行超过 30 秒已超时",
       "cmdTags": ["python", ".py"],
       "cause": "Python GUI 冒烟脚本末尾用 mainloop()/input() 挂起，未主动退出",
       "confidence": 0.7,
       "fixScript": "提示：GUI 冒烟脚本末尾必须用 root.after(毫秒, root.destroy) 自动销毁窗口，禁止用 mainloop()/input() 等待人工",
-      "maxRetry": 1
+      "maxRetry": 2
     },
     {
       "id": "npm-ebadengine-node-version",
-      "regex": "EBADENGINE|Unsupported engine|node.*version.*required",
+      "regex": "EBADENGINE|Unsupported engine",
       "cmdTags": ["npm", "install"],
       "cause": "当前 Node 版本不满足依赖的 engines 要求",
       "confidence": 0.8,
       "fixScript": "node --version; npm --version",
-      "maxRetry": 1
+      "maxRetry": 2
     }
   ]
 }

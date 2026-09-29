@@ -332,12 +332,22 @@ function truncateToolResult(_name: string, result: Record<string, unknown>): Rec
 
 /** 单个工具执行超时（毫秒） */
 const TOOL_TIMEOUT_MS = 30000
+/** install 类命令需要下载大量文件（electron 二进制 100MB+），放宽到 3 分钟 */
+const INSTALL_TIMEOUT_MS = 180000
+const INSTALL_CMD_RE = /\b(npm|pnpm|yarn)\s+(install|i|ci)\b|\bpip3?\s+install\b|\bpy\s+-m\s+pip\b/i
 
 /** 带超时执行工具：超时返回错误结果而不是挂死主循环。
  *  等待人工审批期间暂停计时（审批可无限期等待，人工决定优先于机器超时）。 */
 async function executeToolWithTimeout(call: ToolCall, hooks: ExecHooks, deps: ToolDeps): Promise<Record<string, unknown>> {
   const n = call.function?.name || ''
-  const limit = n === 'await_shell' ? 70000 : n.startsWith('browser_') ? 50000 : TOOL_TIMEOUT_MS
+  let cmdArg = ''
+  if (n === 'run_command' || n === 'await_shell') {
+    try { cmdArg = String(JSON.parse(String((call.function as { arguments?: string } | undefined)?.arguments || '{}')).command || '') } catch { /* 参数解析失败按普通命令处理 */ }
+  }
+  const limit = n === 'await_shell' ? 70000
+    : n.startsWith('browser_') ? 50000
+      : n === 'run_command' && INSTALL_CMD_RE.test(cmdArg) ? INSTALL_TIMEOUT_MS
+        : TOOL_TIMEOUT_MS
   let timer: ReturnType<typeof setTimeout> | undefined
   let remaining = limit
   let stageStart = Date.now()

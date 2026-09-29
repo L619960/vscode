@@ -110,11 +110,13 @@ export class ErrorPatternMatcher {
     this.triggerCount[pattern.id] = (this.triggerCount[pattern.id] || 0) + 1
 
     try {
-      // 用 PowerShell 执行修复脚本（Windows 环境）
+      // 用 PowerShell 执行修复脚本（Windows 环境）；清 ELECTRON_RUN_AS_NODE
+      // 避免宿主变量污染修复脚本内启动的 node/electron 子进程
       const output = execSync(`powershell.exe -NoProfile -Command "${script.replace(/"/g, '""')}"`, {
-        timeout: 60000,
+        timeout: 120000,
         encoding: 'utf-8',
         windowsHide: true,
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined },
       })
       return output
     } catch (e: any) {

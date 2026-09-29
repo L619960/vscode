@@ -570,10 +570,15 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
   const cwdPath = cwdUri.fsPath
 
   /** 单次执行：chcp 65001 保证中文输出编码；强制 Python 以 UTF-8 输出 */
-  const runOnce = async (cmd: string): Promise<Record<string, any>> => {
+  const runOnce = async (rawCmd: string): Promise<Record<string, any>> => {
+    // 剥反引号：cmd.exe 里反引号不是特殊字符，模型常把 PowerShell 的 `URL` 语法
+    // 带进来导致环境变量值被反引号污染（如 ELECTRON_MIRROR=`https://...`），镜像失效
+    const cmd = rawCmd.replace(/`/g, '')
+    // npm/pip install 需下载大量文件，30 秒不够（electron 二进制 100MB+）
+    const isInstall = /\b(npm|pnpm|yarn)\s+(install|i|ci)\b|\bpip3?\s+install\b|\bpy\s+-m\s+pip\b/i.test(cmd)
     try {
       const { stdout: rawOut, stderr: rawErr } = await execPromise(`chcp 65001 >nul && ${cmd}`, {
-        cwd: cwdPath, timeout: 30000, maxBuffer: 10 * 1024 * 1024, windowsHide: true,
+        cwd: cwdPath, timeout: isInstall ? 180000 : 30000, maxBuffer: 10 * 1024 * 1024, windowsHide: true,
         // 清除 ELECTRON_RUN_AS_NODE：扩展宿主进程自身设了此变量，会污染子进程
         // 导致 electron 退化为纯 Node 模式，require('electron') 返回路径字符串而非 API 对象
         env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
@@ -587,11 +592,14 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
         const guiHint = /^python3?(\.exe)?\s+\S+\.py/i.test(cmd)
           ? '——若这是 GUI 冒烟脚本，禁止用 mainloop()/input() 挂起等待人工：脚本末尾必须用 root.after(毫秒, root.destroy) 安排自动销毁，让窗口弹出后自行退出'
           : ''
-        return { ok: false, error: `命令执行超过 30 秒已终止${guiHint}` }
+        return { ok: false, error: `命令执行超过 ${(isInstall ? 180000 : 30000) / 1000} 秒已终止${guiHint}` }
       }
       // exec 在非零退出码时 reject，stderr/stdout 在 e 上
       if (typeof e.code === 'number') {
-        return { ok: false, code: e.code, stdout: String(e.stdout || ''), stderr: String(e.stderr || ''), error: e.stderr ? String(e.stderr).split('\n')[0] : '命令失败' }
+        const errLines = String(e.stderr || '').split('\n')
+        // 首行跳过 npm warn/deprecated 噪音，让模型看到真实报错
+        const realErr = errLines.find(l => l.trim() && !/npm warn|deprecat/i.test(l)) || errLines[0] || '命令失败'
+        return { ok: false, code: e.code, stdout: String(e.stdout || ''), stderr: String(e.stderr || ''), error: realErr.trim() }
       }
       return { ok: false, error: (e as Error).message }
     }
@@ -616,8 +624,9 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
 
   // ★ 错误自愈规则引擎：确定性环境故障自动修复，不浪费大模型推理
   if (!result.ok) {
-    const stderr = String(result.stderr || result.error || '')
-    if (stderr) {
+    // npm 把真实报错混在 stdout/stderr 各处，合并匹配避免漏检
+    const stderr = String(result.stderr || '') + '\n' + String(result.stdout || '') + '\n' + String(result.error || '')
+    if (stderr.trim()) {
       const matcher = ErrorPatternMatcher.getInstance()
       const matched = matcher.match(stderr, command)
       if (matched) {
