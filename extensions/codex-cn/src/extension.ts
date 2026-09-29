@@ -382,6 +382,7 @@ function activate(context: vscode.ExtensionContext): void {
         break
       case 'fetchModels': {
         // 测试 API 地址：请求 OpenAI 兼容的 /models 端点，返回可用模型 id 列表
+        // 注意：部分服务（如火山引擎 Coding Plan）不实现 /models，404 时提示手动填写
         const rawUrl = String(msg.baseUrl || '').trim().replace(/\/+$/, '')
         if (!rawUrl) {
           void webview.postMessage({ type: 'modelsList', seq: msg.seq, error: '请先填写 API 地址' })
@@ -397,7 +398,17 @@ function activate(context: vscode.ExtensionContext): void {
           const resp = await fetch(url, { headers, signal: controller.signal })
           clearTimeout(timer)
           if (!resp.ok) {
-            void webview.postMessage({ type: 'modelsList', seq: msg.seq, error: `服务返回 ${resp.status} ${resp.statusText}` })
+            if (resp.status === 404) {
+              // /models 未实现：尝试用预设模型名测试 /chat/completions 是否可用
+              const presetModel = String(msg.model || '').trim()
+              if (presetModel) {
+                void webview.postMessage({ type: 'modelsList', seq: msg.seq, models: [presetModel], note: '该服务未提供模型列表，已使用当前填写的模型名' })
+              } else {
+                void webview.postMessage({ type: 'modelsList', seq: msg.seq, error: '该服务未提供模型列表接口（404），请手动填写模型名称后保存' })
+              }
+            } else {
+              void webview.postMessage({ type: 'modelsList', seq: msg.seq, error: `服务返回 ${resp.status} ${resp.statusText}` })
+            }
             break
           }
           const data = await resp.json() as { data?: Array<{ id?: string }> }

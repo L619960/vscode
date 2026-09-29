@@ -56,12 +56,17 @@ async function fetchModels(): Promise<void> {
   modelsLoading.value = true
   modelError.value = ''
   try {
-    const models = await call('fetchModels', { baseUrl }) as string[]
-    if (models.length === 1) {
-      patch({ model: models[0] })
-    } else {
-      fetchedModels.value = models
-      showModelsPop.value = true
+    const result = await call('fetchModels', { baseUrl, model: cfg.value.model }) as { models?: string[]; error?: string; note?: string }
+    if (result.error) {
+      modelError.value = result.error
+    } else if (result.models?.length) {
+      if (result.models.length === 1) {
+        patch({ model: result.models[0] })
+        if (result.note) modelError.value = result.note
+      } else {
+        fetchedModels.value = result.models
+        showModelsPop.value = true
+      }
     }
   } catch (e) { modelError.value = String(e) }
   modelsLoading.value = false
