@@ -5,6 +5,7 @@ import type { LLMConfig } from './llm.js'
 
 export const PROVIDER_PRESETS: Record<string, { url: string; model: string; label: string }> = {
   doubao: { label: '豆包 (火山引擎)', url: 'https://ark.cn-beijing.volces.com/api/v3', model: 'doubao-pro-32k' },
+  volcesPlan: { label: '火山引擎 Coding Plan', url: 'https://ark.cn-beijing.volces.com/api/plan/v3', model: 'ark-code-latest' },
   deepseek: { label: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
   qwen: { label: '通义千问', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
   kimi: { label: 'Kimi (月之暗面)', url: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
