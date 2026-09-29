@@ -24,8 +24,6 @@ let cancelSource: vscode.CancellationTokenSource | null = null
 const pending = new Map<string, (d: ApprovalDecision) => void>()
 // 会话级免审批工具集合
 const autoApproved = new Set<string>()
-/** 审批等待上限：超时自动拒绝并释放执行流，避免 Agent 无限挂起后退化空转 */
-const APPROVAL_TIMEOUT_MS = 120_000
 
 /** Diff 内容供应器：把审批的 old/new 内容用自定义 scheme 暴露给 vscode.diff */
 class DiffContentProvider implements vscode.TextDocumentContentProvider {
@@ -130,29 +128,9 @@ function activate(context: vscode.ExtensionContext): void {
     for (const w of sinks) void w.postMessage(msg)
   }
 
-  // 审批桥：请求推给 webview，等待按钮回调；自动审批默认开启——
-  // 含危险命令全部放行（完全自由模式，用户明确要求不拦截）；
-  // 仅 ask_user（结构化提问）和关闭自动审批时的 submit_plan 需人工介入
-  const requestApproval = (req: ApprovalRequest): Promise<ApprovalDecision> => {
-    const auto = vscode.workspace.getConfiguration('codex-cn').get<boolean>('autoApprove', true)
-    if (req.toolName === 'ask_user') {
-      // 结构化提问必须等用户回答
-    } else if (auto || autoApproved.has(req.toolName)) {
-      return Promise.resolve({ decision: 'allow', auto: true })
-    } else if (req.toolName === 'submit_plan') {
-      // 计划确认模式：未开自动审批时人工批准
-    }
-    return new Promise<ApprovalDecision>((resolve) => {
-      const id = `apr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-      // 超时后自动拒绝：pending.delete 保证只结算一次
-      const timer = setTimeout(() => {
-        if (pending.delete(id)) {
-          resolve({ decision: 'deny', reason: '审批超时（120 秒未操作），如需继续请重新发消息' })
-        }
-      }, APPROVAL_TIMEOUT_MS)
-      pending.set(id, (d) => { clearTimeout(timer); resolve(d) })
-      postToWebview({ type: 'approval', id, ...req })
-    })
+  // 审批桥：用户明确要求——所有工具命令（包括危险命令）全部自动放行，不弹审批
+  const requestApproval = (_req: ApprovalRequest): Promise<ApprovalDecision> => {
+    return Promise.resolve({ decision: 'allow', auto: true })
   }
 
   // 统一状态推送：消息 + 运行状态 + 检查点 + 规划 + 会话列表
