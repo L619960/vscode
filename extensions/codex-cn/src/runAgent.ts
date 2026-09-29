@@ -76,20 +76,19 @@ function detectLoop(text: string): boolean {
   return false
 }
 
-/** 截断恢复指令：明确禁止重复巨型调用，强制骨架+分批 edit 工作流 */
+/** 截断恢复指令：引导模型用更紧凑的写法或分批 edit */
 const TRUNCATION_RECOVERY = [
   '上一次工具调用因参数内容过长，在生成中途被截断（JSON 不完整，服务端无法解析）。',
-  '注意：重复同样的一次性写法必然再次失败，必须立即改为分批写入：',
-  '1. 现在只用 write_file 写入不超过 150 行的可运行骨架（imports、类与函数签名、主界面/主流程结构），未实现的函数体用 pass 或带唯一标记的占位行（如 # TODO: 功能名）；',
-  '2. 然后连续调用多次 edit_file，每批定位一个占位锚点，填充 100-150 行实现；',
-  '3. 重复第 2 步直到功能完整，最后通读自查。',
-  '现在只输出第 1 步的 write_file 骨架调用，不要输出完整实现。',
+  '注意：重复同样的一次性写法必然再次失败，必须改为更紧凑的写法或分批写入：',
+  '1. 精简代码，去掉冗余注释与空行，用更紧凑的风格重写；',
+  '2. 或先 write_file 写入核心结构，再用 edit_file 分批补充细节；',
+  '现在只输出精简后的 write_file 调用。',
 ].join('\n')
 
-/** write_file 单次行数硬上限：模型提示词遵循不稳定，用代码兜底防截断 */
-const WRITE_FILE_MAX_LINES = 300
+/** write_file 单次行数硬上限：防止 JSON 生成中途截断 */
+const WRITE_FILE_MAX_LINES = 800
 /** edit_file 单批 replace 行数硬上限 */
-const EDIT_BATCH_MAX_LINES = 250
+const EDIT_BATCH_MAX_LINES = 600
 
 /**
  * 写类工具规模硬约束：超限时不执行，直接返回错误引导分批写入。
@@ -100,7 +99,7 @@ function enforceWriteSizePolicy(name: string, args: Record<string, unknown>): st
     const n = String(args.content ?? '').split('\n').length
     if (n > WRITE_FILE_MAX_LINES) {
       return `write_file 内容 ${n} 行，超过单次 ${WRITE_FILE_MAX_LINES} 行硬上限——继续生成必然在中途截断。`
-        + '请立即改为：write_file 写不超过 150 行骨架（函数体用 pass/# TODO 占位），再多次 edit_file 每批填充 100-150 行。'
+        + '请精简代码（去掉冗余注释/空行），或先写核心结构再用 edit_file 补充细节。'
     }
   }
   if (name === 'edit_file' && Array.isArray(args.edits)) {
@@ -330,11 +329,11 @@ async function buildApiMessages(
 }
 
 /** 单个工具结果长度上限（字符），超过则智能截断 */
-const TOOL_RESULT_MAX = 12000
+const TOOL_RESULT_MAX = 30000
 
 /**
  * 超长工具结果智能截断：
- * - read_file：保留前 500 行（大部分源文件可一次读完，避免分页浪费轮次）
+ * - read_file：保留前 1000 行（大部分源文件可一次读完，避免分页浪费轮次）
  * - run_command：保留前 200 行
  * - search_files：保留前 30 条匹配
  * - 其他：截断超长字符串字段
@@ -345,8 +344,8 @@ function truncateToolResult(name: string, result: Record<string, unknown>): Reco
   if (name === 'read_file' && typeof result.content === 'string') {
     const text = result.content as string
     const lines = text.split('\n')
-    const content = lines.length > 500
-      ? lines.slice(0, 500).join('\n') + `\n... (truncated，共 ${lines.length} 行，可用 start_line/end_line 分段继续读取)`
+    const content = lines.length > 1000
+      ? lines.slice(0, 1000).join('\n') + `\n\n... (文件共 ${lines.length} 行，已显示前 1000 行。如需看后续内容请用 start_line=1001 继续读取，不要重复读取已看过的部分)`
       : text.slice(0, TOOL_RESULT_MAX) + '\n... (truncated)'
     return { ...result, content, truncated: true }
   }
