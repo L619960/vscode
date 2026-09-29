@@ -63,7 +63,8 @@ export async function chatCompletion(opts: {
       model: config.model,
       messages,
       stream: true,
-      max_tokens: 16384,
+      // 8192 上限：既够单文件代码生成（约 6KB），又限制小模型无限发散思考链（过度思考）
+      max_tokens: 8192,
       ...(withTools && tools?.length ? { tools, tool_choice: 'auto' } : {}),
     })
 

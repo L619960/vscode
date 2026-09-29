@@ -12,6 +12,9 @@ import type { TaskBoard, TaskCheckpoint } from './taskBoard.js'
 import type { SkillsStore } from './skills.js'
 import type { McpManager } from './mcp.js'
 import type { ChatMessage, ToolCall } from './types.js'
+import { execSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 
 const MAX_ROUNDS = 200
 /** 连续 LLM 错误上限：超过则终止任务，避免死循环 */
@@ -20,6 +23,40 @@ const MAX_CONSECUTIVE_ERRORS = 3
 const MAX_EMPTY_RESPONSES = 3
 /** 同一任务内退化循环熔断上限：连续触发即终止任务 */
 const MAX_LOOP_TRIPS = 2
+/** 停滞硬上限：累计无进展轮次达此值即强制终止（措辞催办+宿主求真均无效的兜底） */
+const STAGNANT_HARD_LIMIT = 6
+
+/**
+ * 宿主侧强制执行命令（不经过模型决策、不走审批），拿物理现实的真实结果。
+ * 用于"分析瘫痪"时宿主替模型完成验证（ctrl-alt-pray 的 ground-truth 思路）。
+ */
+function hostExec(command: string, cwd: string, timeoutMs = 30000): { ok: boolean; output: string; exitCode: number } {
+  try {
+    const stdout = execSync(command, { cwd, timeout: timeoutMs, encoding: 'utf-8', windowsHide: true })
+    return { ok: true, output: stdout.trimEnd(), exitCode: 0 }
+  } catch (e) {
+    const err = e as { stdout?: string; stderr?: string; status?: number; message?: string }
+    const output = [err.stdout?.trimEnd(), err.stderr?.trimEnd()].filter(Boolean).join('\n')
+    return { ok: false, output: output || err.message || '命令执行失败', exitCode: err.status ?? 1 }
+  }
+}
+
+/**
+ * 构造宿主强制验证命令：
+ * - 对所有已产出的 .py 文件跑 py_compile
+ * - 工作区存在 smoke_test.py 时追加运行
+ * 返回 undefined 表示当前无可用的自动验证手段。
+ */
+function buildHostVerifyCommand(modifiedPaths: Set<string>, rootDir: string): string | undefined {
+  const pyFiles = [...modifiedPaths].filter(p => /\.py$/i.test(p))
+  const parts: string[] = []
+  if (pyFiles.length) {
+    const files = pyFiles.map(p => `"${p.replace(/"/g, '\\"')}"`).join(' ')
+    parts.push(`py -m py_compile ${files}`)
+  }
+  if (existsSync(join(rootDir, 'smoke_test.py'))) parts.push('py smoke_test.py')
+  return parts.length ? parts.join(' && ') : undefined
+}
 
 /**
  * 退化循环检测：流式文本末尾若有某片段（40~200 字）连续重复 ≥4 次，
@@ -143,6 +180,11 @@ function compressHistory(messages: ChatMessage[]): ChatMessage[] {
   const recent = rest.slice(-KEEP_RECENT_MESSAGES)
   // 丢掉 recent 开头的孤儿 tool 消息（对应 assistant 调用已被折叠），避免协议错乱
   while (recent.length && recent[0].role === 'tool') recent.shift()
+  // 丢掉 recent 末尾配对不全的 assistant(tool_calls)（其 tool 消息被切到 old 折叠），
+  // 否则 llama/OpenAI 校验报 "insufficient tool messages following tool_calls message"
+  while (recent.length && recent[recent.length - 1].role === 'assistant' && recent[recent.length - 1].tool_calls?.length) {
+    old.push(recent.pop()!)
+  }
 
   // 从早期消息中提取关键决策（工具调用记录）
   const decisions: string[] = []
@@ -460,8 +502,10 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
     let loopTripCount = 0 // 退化循环熔断累计（跨轮，达上限终止任务）
     let confirmBlocked = 0 // "请确认"零产出收尾拦截次数（最多 2 次防死循环）
     let stagnantActionRounds = 0 // 连续"只读/规划无推进"轮数
-    let stagnantWarned = 0 // 行动催办次数（最多 2 次防刷屏）
+    let stagnantWarned = 0 // 停滞处置次数：第 1 次措辞催办，第 2 次宿主强制求真
+    let stagnantTotal = 0 // 累计停滞轮数（措辞/求真后不归零），达 STAGNANT_HARD_LIMIT 熔断
     let deliveryRemindCount = 0 // 交付闸门拦截次数（冒烟通过后仍规划时强制汇报，最多 2 次）
+    let stoppedReason: 'maxRounds' | 'stagnant' = 'maxRounds'
     for (let round = 1; round <= MAX_ROUNDS; round++) {
       if (token.isCancellationRequested || abort.signal.aborted) return
 
@@ -483,14 +527,79 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         })
       }
 
-      // ★行动催办：连续多轮只读取/加载技能/更新规划而无修改或验证——分析瘫痪，强制直接行动
-      if (stagnantActionRounds >= 3 && stagnantWarned < 2) {
-        stagnantWarned++
-        messages.push({
-          role: 'user',
-          content: `[系统·行动催办] 你已连续 ${stagnantActionRounds} 轮只在读取文件/加载技能/更新规划，没有任何修改或验证，属于原地打转。现有产出：${[...modifiedPaths].slice(0, 6).join('、') || '尚无文件'}。本轮必须直接行动，二选一：1) run_command 立即运行冒烟脚本（含 GUI 自毁，禁止 mainloop 挂起）2) edit_file/write_file 修复或补全具体缺口。禁止再重复读取已读文件、禁止再加载已加载技能、禁止只输出分析文本。`,
-        })
-        stagnantActionRounds = 0 // 给一轮响应窗口
+      // ★分析瘫痪三级处置：
+      //   Level 1 连续停滞 2 轮：措辞强制具体行动
+      //   Level 2 措辞后仍停滞 2 轮：宿主直接执行验证，真实结果作为 tool 消息注入（不依赖模型自觉）
+      //   Level 3 累计停滞达 STAGNANT_HARD_LIMIT：强制终止并如实汇报（轮末检查）
+      if (stagnantActionRounds >= 2 && stagnantWarned < 2) {
+        const hasFiles = modifiedPaths.size > 0
+        const notVerified = lastVerifyRound < lastModifyRound
+        if (stagnantWarned === 0) {
+          // ── Level 1：措辞催办，按场景直接给具体指令，不给选择 ──
+          stagnantWarned++
+          let order: string
+          if (hasFiles && notVerified) {
+            // 有产物但没验证：直接强制跑冒烟，不给选择
+            order = `现有产物（${[...modifiedPaths].slice(0, 6).join('、')}）尚未验证。本轮必须立即 run_command 执行冒烟测试：对每个 .py 文件运行 \`py -m py_compile <file>\`，并写一个 smoke_test.py 做实例化+自毁验证（GUI 用 root.after(2000, root.destroy) 自毁，禁止 mainloop 挂起）。验证通过后直接输出三段式交付汇报。禁止再读文件、禁止再规划。`
+          } else if (hasFiles) {
+            // 有产物且已验证：直接交付
+            order = `现有产物（${[...modifiedPaths].slice(0, 6).join('、')}）已验证通过。本轮必须直接输出三段式交付汇报（修改内容/验证方式/当前状态）。禁止再读文件、禁止再规划、禁止再调用任何工具。`
+          } else {
+            // 还没产物：强制写第一个文件
+            order = `尚无任何产物文件。本轮必须立即 write_file 写出第一个可运行的代码文件（数据库模块或主程序入口），写完即 run_command 验证语法。禁止再读文件、禁止再加载技能、禁止只输出分析文本。`
+          }
+          messages.push({
+            role: 'user',
+            content: `[系统·行动催办] 你已连续 ${stagnantActionRounds} 轮只在读取文件/加载技能/更新规划，没有任何修改或验证，属于原地打转。${order}`,
+          })
+          stagnantActionRounds = 0 // 给一轮响应窗口
+        } else {
+          // ── Level 2：措辞催办无效，宿主强制求真：直接跑验证并把真实结果喂给模型 ──
+          stagnantWarned++
+          const rootDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd()
+          const command = buildHostVerifyCommand(modifiedPaths, rootDir)
+          if (command) {
+            const exec = hostExec(command, rootDir)
+            const callId = `host_verify_${Date.now()}`
+            const resultJson = JSON.stringify({
+              ok: exec.ok,
+              exit_code: exec.exitCode,
+              stdout: exec.output.slice(0, 2000) || '(无输出)',
+              note: '本命令由系统检测到分析瘫痪后自动执行（非模型决策），结果为真实运行结果。',
+            })
+            assistantMsg.toolRuns!.push({
+              id: callId,
+              name: 'run_command',
+              argsSummary: `系统自动验证: ${command.slice(0, 80)}`,
+              argsJson: JSON.stringify({ command }),
+              status: exec.ok ? 'done' : 'error',
+              resultJson,
+              resultSummary: exec.ok ? '自动验证通过' : '自动验证失败',
+            })
+            messages.push({
+              role: 'assistant',
+              content: null,
+              tool_calls: [{
+                id: callId,
+                type: 'function',
+                function: { name: 'run_command', arguments: JSON.stringify({ command }) },
+              }],
+            })
+            messages.push({ role: 'tool', tool_call_id: callId, content: resultJson })
+            lastVerifyRound = round
+            const verdict = exec.ok
+              ? '系统自动验证已通过，真实结果如上。禁止再读文件、禁止再规划，本轮直接输出三段式交付汇报（修改内容/验证方式/当前状态）。'
+              : '系统自动验证失败，真实错误如上。禁止再读任何文件，本轮必须只针对上述错误直接修改对应文件，然后用 run_command 重验。'
+            messages.push({ role: 'user', content: `[系统·强制求真] ${verdict}` })
+          } else {
+            // 尚无产物，宿主无法代替创作：最后强制一次写文件，仍不动则由硬上限终止
+            messages.push({
+              role: 'user',
+              content: '[系统·最后通牒] 系统已确认你连续多轮零产出。本轮必须立即 write_file 写出第一个代码文件并验证语法。继续只输出分析文本将强制终止任务。',
+            })
+          }
+          stagnantActionRounds = 0
+        }
       }
 
       // 退化循环熔断：流式生成中检测到重复片段即中止本次请求
@@ -563,6 +672,19 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         continue
       }
       consecutiveErrors = 0
+
+      // ★检查点催办：每 5 轮一次，提醒更新 running 过久的检查点。
+      // 必须在 push assistant 之前注入——插入 assistant/tool 配对之间会触发 400（tool 必须紧跟 assistant）
+      if (round % 5 === 0 && deps.taskBoard) {
+        const pending = deps.taskBoard.items.filter((i: TaskCheckpoint) => i.status === 'running')
+        if (pending.length > 0) {
+          const names = pending.map((i: TaskCheckpoint) => i.label).slice(0, 3).join('、')
+          messages.push({
+            role: 'user',
+            content: `[系统提醒] 任务规划中有 ${pending.length} 个检查点仍处于运行状态（如：${names}）。请及时调用 todo_write 更新已完成的检查点状态，或继续推进任务。`,
+          })
+        }
+      }
 
       messages.push({
         role: 'assistant',
@@ -784,17 +906,6 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
             deps.onChange()
             messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
             continue
-          }
-
-          // ★检查点催办：每 5 轮检查一次，有 running 状态超过 10 轮的检查点时提醒更新
-          if (round % 5 === 0 && round > 0 && deps.taskBoard) {
-            const pending = deps.taskBoard.items.filter((i: TaskCheckpoint) => i.status === 'running')
-            if (pending.length > 0) {
-              const names = pending.map((i: TaskCheckpoint) => i.label).slice(0, 3).join('、')
-              const reminder = `[系统提醒] 任务规划中有 ${pending.length} 个检查点仍处于运行状态（如：${names}）。请及时调用 todo_write 更新已完成的检查点状态，或继续推进任务。`
-              messages.push({ role: 'user', content: reminder })
-              // 不中断当前工具执行，仅追加提醒
-            }
           }
 
           // ★MCP 工具：mcp__server__tool 路由到 McpManager（外部服务器，执行前需用户批准）
@@ -1071,14 +1182,41 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           deps.onChange()
         }
       }
-      // 本轮有修改/命令执行则清零停滞计数；全是只读/规划/被拦则累积（达 3 轮下轮注入行动催办）
+      // 本轮有修改/命令执行则清零停滞计数；全是只读/规划/被拦则累积
       stagnantActionRounds = roundHadProgress ? 0 : stagnantActionRounds + 1
+      stagnantTotal = roundHadProgress ? 0 : stagnantTotal + 1
+      deps.session.save()
+      // Level 3：措辞催办与宿主求真均未带来进展，硬上限熔断，避免无限烧时间
+      if (stagnantTotal >= STAGNANT_HARD_LIMIT) {
+        stoppedReason = 'stagnant'
+        break
+      }
     }
-    deps.session.add({
-      role: 'assistant',
-      content: `已达最大轮次（${MAX_ROUNDS}），已停止。可发送「继续」让 AI 接着执行。`,
-      time: deps.session.now(),
-    })
+    if (stoppedReason === 'stagnant') {
+      const fileList = modifiedPaths.size
+        ? [...modifiedPaths].slice(0, 10).join('\n- ')
+        : '（无产物文件）'
+      const verified = lastVerifyRound >= lastModifyRound && modifiedPaths.size > 0
+      deps.session.add({
+        role: 'assistant',
+        content: [
+          '任务因连续无进展已自动停止（系统熔断，已达到停滞硬上限）。为避免继续空转烧时间，现如实汇报当前真实状态：',
+          '',
+          `【修改内容】已产出文件：\n- ${fileList}`,
+          '',
+          `【验证方式】系统/模型执行状态：${verified ? '已完成验证（最近一轮验证通过）' : '未完成有效验证'}。`,
+          '',
+          '【当前状态】模型反复停留在读取/分析阶段，系统已分别尝试措辞催办与自动验证注入，仍未能继续推进。建议：发送「继续」并补充更具体的指示，或人工接手处理上述文件中可能存在的问题。',
+        ].join('\n'),
+        time: deps.session.now(),
+      })
+    } else {
+      deps.session.add({
+        role: 'assistant',
+        content: `已达最大轮次（${MAX_ROUNDS}），已停止。可发送「继续」让 AI 接着执行。`,
+        time: deps.session.now(),
+      })
+    }
     deps.onChange()
   } catch (e) {
     vscode.window.showErrorMessage(`Codex CN 内部错误: ${(e as Error).message}`)
