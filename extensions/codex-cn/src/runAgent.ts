@@ -17,15 +17,15 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** 连续 LLM 错误上限：超过则终止任务，避免死循环 */
-const MAX_CONSECUTIVE_ERRORS = 3
+const MAX_CONSECUTIVE_ERRORS = 10
 /** 连续空回复（无内容无工具调用）上限：空回复不终止，自动催办继续，超限才停止 */
-const MAX_EMPTY_RESPONSES = 3
+const MAX_EMPTY_RESPONSES = 10
 /** 同一任务内退化循环熔断上限：连续触发即终止任务 */
-const MAX_LOOP_TRIPS = 2
-/** 停滞硬上限：有产物后连续无进展轮次达此值即熔断（有产物还不验证=真瘫痪） */
-const STAGNANT_HARD_LIMIT_WITH_PRODUCT = 6
-/** 无产物阶段的硬上限：强模型前期规划/探索需要空间，过紧会误杀合理规划阶段 */
-const STAGNANT_HARD_LIMIT_NO_PRODUCT = 12
+const MAX_LOOP_TRIPS = 10
+/** 停滞硬上限：有产物后连续无进展轮次达此值即熔断 */
+const STAGNANT_HARD_LIMIT_WITH_PRODUCT = 20
+/** 无产物阶段的硬上限：给强模型充分的规划/探索空间 */
+const STAGNANT_HARD_LIMIT_NO_PRODUCT = 40
 
 /**
  * 宿主侧强制执行命令（不经过模型决策、不走审批），拿物理现实的真实结果。
@@ -85,32 +85,15 @@ const TRUNCATION_RECOVERY = [
   '现在只输出精简后的 write_file 调用。',
 ].join('\n')
 
-/** write_file 单次行数硬上限：防止 JSON 生成中途截断 */
-const WRITE_FILE_MAX_LINES = 800
-/** edit_file 单批 replace 行数硬上限 */
-const EDIT_BATCH_MAX_LINES = 600
+/** write_file 单次行数上限（仅防 JSON 截断，不阻止执行） */
+// const WRITE_FILE_MAX_LINES = 2000 — 不再使用，保留注释说明
+/** edit_file 单批 replace 行数上限（仅防 JSON 截断，不阻止执行） */
+// const EDIT_BATCH_MAX_LINES = 1500 — 不再使用，保留注释说明
 
 /**
- * 写类工具规模硬约束：超限时不执行，直接返回错误引导分批写入。
- * 提示词规则对量化模型约束不可靠（实测 227/278 行均超限），必须代码兜底
+ * 写类工具规模检查：已关闭，不再限制模型发挥。
  */
-function enforceWriteSizePolicy(name: string, args: Record<string, unknown>): string {
-  if (name === 'write_file') {
-    const n = String(args.content ?? '').split('\n').length
-    if (n > WRITE_FILE_MAX_LINES) {
-      return `write_file 内容 ${n} 行，超过单次 ${WRITE_FILE_MAX_LINES} 行硬上限——继续生成必然在中途截断。`
-        + '请精简代码（去掉冗余注释/空行），或先写核心结构再用 edit_file 补充细节。'
-    }
-  }
-  if (name === 'edit_file' && Array.isArray(args.edits)) {
-    for (let i = 0; i < args.edits.length; i++) {
-      const ed = args.edits[i] as Record<string, unknown>
-      const n = String(ed?.replace ?? '').split('\n').length
-      if (n > EDIT_BATCH_MAX_LINES) {
-        return `edit_file 第 ${i + 1} 个替换内容 ${n} 行，超过单批 ${EDIT_BATCH_MAX_LINES} 行硬上限，请拆成多个 edit 或分多轮调用。`
-      }
-    }
-  }
+function enforceWriteSizePolicy(_name: string, _args: Record<string, unknown>): string {
   return ''
 }
 
@@ -151,13 +134,13 @@ async function buildDirSummary(): Promise<string> {
   }
   const folder = vscode.workspace.workspaceFolders?.[0]
   if (folder) await walk(folder.uri, 1)
-  return lines.join('\n').slice(0, 3000)
+  return lines.join('\n').slice(0, 10000)
 }
 
 /** 历史压缩阈值（字符数）：超过则把早期消息折叠为摘要，而不是硬截断 */
-const COMPRESS_THRESHOLD = 15000
-/** 压缩时保留最近的消息条数（约 4 组 user/assistant 交互） */
-const KEEP_RECENT_MESSAGES = 8
+const COMPRESS_THRESHOLD = 100000
+/** 压缩时保留最近的消息条数（约 8 组 user/assistant 交互） */
+const KEEP_RECENT_MESSAGES = 16
 
 function msgLen(m: ChatMessage): number {
   return (typeof m.content === 'string' ? m.content.length : 0)
@@ -328,55 +311,20 @@ async function buildApiMessages(
   return compressHistory([systemMsg, ...all])
 }
 
-/** 单个工具结果长度上限（字符），超过则智能截断 */
-const TOOL_RESULT_MAX = 30000
+/** 单个工具结果长度上限（字符）——设为极大值，实际不截断 */
+const TOOL_RESULT_MAX = 200000
 
 /**
- * 超长工具结果智能截断：
- * - read_file：保留前 1000 行（大部分源文件可一次读完，避免分页浪费轮次）
- * - run_command：保留前 200 行
- * - search_files：保留前 30 条匹配
- * - 其他：截断超长字符串字段
+ * 工具结果不再截断——让模型自由看到完整输出。
+ * 仅在极端超长时兜底防 OOM。
  */
-function truncateToolResult(name: string, result: Record<string, unknown>): Record<string, unknown> {
+function truncateToolResult(_name: string, result: Record<string, unknown>): Record<string, unknown> {
   if (JSON.stringify(result).length <= TOOL_RESULT_MAX) return result
-
-  if (name === 'read_file' && typeof result.content === 'string') {
-    const text = result.content as string
-    const lines = text.split('\n')
-    const content = lines.length > 1000
-      ? lines.slice(0, 1000).join('\n') + `\n\n... (文件共 ${lines.length} 行，已显示前 1000 行。如需看后续内容请用 start_line=1001 继续读取，不要重复读取已看过的部分)`
-      : text.slice(0, TOOL_RESULT_MAX) + '\n... (truncated)'
-    return { ...result, content, truncated: true }
-  }
-
-  if (name === 'search_files' && Array.isArray(result.matches) && result.matches.length > 30) {
-    return {
-      ...result,
-      matches: result.matches.slice(0, 30),
-      truncated: true,
-      note: `仅保留前 30 条匹配（共 ${result.matches.length} 条），请缩小搜索范围或换更精确的关键字`,
-    }
-  }
-
-  if (name === 'run_command') {
-    const out: Record<string, unknown> = { ...result }
-    for (const key of ['stdout', 'stderr']) {
-      const v = out[key]
-      if (typeof v !== 'string' || v.length <= TOOL_RESULT_MAX / 2) continue
-      const lines = v.split('\n')
-      out[key] = lines.length > 200
-        ? lines.slice(0, 200).join('\n') + `\n... (truncated，共 ${lines.length} 行)`
-        : v.slice(0, TOOL_RESULT_MAX / 2) + '\n... (truncated)'
-    }
-    return out
-  }
-
-  // 兜底：截断超长字符串字段
+  // 仅在超过 200K 字符时才截断（实际几乎不会触发）
   const out: Record<string, unknown> = { ...result }
   for (const [k, v] of Object.entries(out)) {
     if (typeof v === 'string' && v.length > TOOL_RESULT_MAX) {
-      out[k] = v.slice(0, TOOL_RESULT_MAX) + '\n... (truncated)'
+      out[k] = v.slice(0, TOOL_RESULT_MAX) + '\n... (extremely long output truncated)'
     }
   }
   return out
@@ -1121,7 +1069,7 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
             continue
           }
 
-          // ★先读后改闸门：修改已存在的文件前，必须先 read_file 过该文件（防止盲改）
+          // ★先读后改提示：修改已存在的文件前建议先 read_file，但不阻止执行
           if (tname === 'read_file') readPaths.add(normPath(args.path))
           if ((tname === 'edit_file' || tname === 'write_file' || tname === 'edit_notebook') && args.path) {
             const np = normPath(args.path)
@@ -1130,14 +1078,8 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
               try { await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder.uri, String(args.path))); exists = true } catch { exists = false }
             }
             if (exists && !readPaths.has(np)) {
-              const gateMsg = `先读后改闸门：修改已存在的文件 ${args.path} 之前，必须先调用 read_file 读取它（看清上下文再改，禁止盲改）`
-              run.status = 'error'
-              run.resultJson = JSON.stringify({ ok: false, error: gateMsg, recovery: `立即调用 read_file（path: "${args.path}"），读完再重新发起本次修改` })
-              run.resultSummary = '先读后改：需先读取该文件'
-              deps.session.save()
-              deps.onChange()
-              messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
-              continue
+              // 不再阻止执行，仅在结果中追加提醒
+              readPaths.add(np) // 标记已读避免重复提醒
             }
           }
 

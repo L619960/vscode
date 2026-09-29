@@ -164,11 +164,8 @@ async function execRead(call: ToolCall): Promise<Record<string, unknown>> {
     const start = Math.max(1, args.start_line || 1)
     const end = Math.min(total, args.end_line || total)
     const slice = lines.slice(start - 1, end)
-    const maxLines = 1000
-    const truncated = slice.length > maxLines
-    const outLines = truncated ? slice.slice(0, maxLines) : slice
-    const content = outLines.map((l, i) => `${start + i}| ${l}`).join('\n')
-    return { ok: true, path: normalizeRel(args.path), total_lines: total, content, start_line: start, truncated }
+    const content = slice.map((l, i) => `${start + i}| ${l}`).join('\n')
+    return { ok: true, path: normalizeRel(args.path), total_lines: total, content, start_line: start, truncated: false }
   } catch (e) {
     return { ok: false, error: (e as Error).message }
   }
@@ -194,10 +191,9 @@ async function execListDir(call: ToolCall): Promise<Record<string, unknown>> {
   try {
     const baseRel = normalizeRel(args.path || '.')
     const baseUri = baseRel === '' ? rootUri() : toUri(baseRel)
-    const maxDepth = Math.min(3, Math.max(1, args.depth ?? 1))
+    const maxDepth = Math.min(5, Math.max(1, args.depth ?? 1))
     const entries = await walkDir(baseUri, maxDepth)
-    const max = 300
-    return { ok: true, entries: entries.slice(0, max), truncated: entries.length > max }
+    return { ok: true, entries, truncated: false }
   } catch (e) {
     return { ok: false, error: (e as Error).message }
   }
@@ -274,8 +270,8 @@ async function execGlob(call: ToolCall): Promise<Record<string, unknown>> {
   try {
     const baseRel = normalizeRel(args.path || '.')
     const baseUri = baseRel === '' ? rootUri() : toUri(baseRel)
-    const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(baseUri, pattern), null, 300)
-    const paths = uris.map((u) => vscode.workspace.asRelativePath(u)).slice(0, 200)
+    const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(baseUri, pattern), null, 1000)
+    const paths = uris.map((u) => vscode.workspace.asRelativePath(u))
     return { ok: true, pattern, count: paths.length, paths }
   } catch (e) {
     return { ok: false, error: (e as Error).message }
@@ -311,9 +307,7 @@ async function execWebFetch(call: ToolCall): Promise<Record<string, unknown>> {
       content = await resp.text()
     }
     content = ctype.includes('html') ? htmlToText(content) : content
-    const max = 6000
-    const truncated = content.length > max
-    return { ok: true, url, content: content.slice(0, max), truncated }
+    return { ok: true, url, content, truncated: false }
   } catch (e) {
     return { ok: false, error: `抓取失败: ${(e as Error).message}` }
   }
@@ -334,7 +328,7 @@ async function execReadLints(call: ToolCall): Promise<Record<string, unknown>> {
       line: d.range.start.line + 1, col: d.range.start.character + 1,
       severity: SEVERITY_LABEL[d.severity] || 'hint',
       message: d.message, source: d.source || '',
-    }))).slice(0, 100)
+    })))
     const errors = diagnostics.filter((d) => d.severity === 'error').length
     const warnings = diagnostics.filter((d) => d.severity === 'warning').length
     return { ok: true, count: diagnostics.length, errors, warnings, diagnostics }
@@ -578,12 +572,11 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
   const runOnce = async (cmd: string): Promise<Record<string, any>> => {
     try {
       const { stdout: rawOut, stderr: rawErr } = await execPromise(`chcp 65001 >nul && ${cmd}`, {
-        cwd: cwdPath, timeout: 30000, maxBuffer: 2 * 1024 * 1024, windowsHide: true,
+        cwd: cwdPath, timeout: 30000, maxBuffer: 10 * 1024 * 1024, windowsHide: true,
         env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
       })
-      const max = 8192
-      const stdout = String(rawOut || '').length > max ? String(rawOut).slice(0, max) + '\n[输出已截断]' : String(rawOut || '')
-      const stderr = String(rawErr || '').length > max ? String(rawErr).slice(0, max) + '\n[输出已截断]' : String(rawErr || '')
+      const stdout = String(rawOut || '')
+      const stderr = String(rawErr || '')
       return { ok: true, code: 0, stdout, stderr }
     } catch (e: any) {
       if (e.killed && e.signal === 'SIGTERM') {
@@ -595,9 +588,7 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
       }
       // exec 在非零退出码时 reject，stderr/stdout 在 e 上
       if (typeof e.code === 'number') {
-        const stdout = String(e.stdout || '').slice(0, 8192)
-        const stderr = String(e.stderr || '').slice(0, 8192)
-        return { ok: false, code: e.code, stdout, stderr, error: stderr ? stderr.split('\n')[0] : '命令失败' }
+        return { ok: false, code: e.code, stdout: String(e.stdout || ''), stderr: String(e.stderr || ''), error: e.stderr ? String(e.stderr).split('\n')[0] : '命令失败' }
       }
       return { ok: false, error: (e as Error).message }
     }

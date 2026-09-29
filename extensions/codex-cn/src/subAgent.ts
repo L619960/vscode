@@ -22,9 +22,9 @@ export interface SubTask {
 export class SubAgentManager {
   private tasks = new Map<string, SubTask>()
   private running = 0
-  private readonly MAX_PARALLEL = 2
-  private readonly DEFAULT_TIMEOUT = 120_000
-  private readonly MAX_ROUNDS = 30 // 子 Agent 轮次上限（比主循环更紧，防失控）
+  private readonly MAX_PARALLEL = 4
+  private readonly DEFAULT_TIMEOUT = 300_000
+  private readonly MAX_ROUNDS = 100
 
   constructor(
     private readonly getApiKey: () => Promise<string>,
