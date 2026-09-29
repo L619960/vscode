@@ -330,12 +330,13 @@ async function buildApiMessages(
 }
 
 /** 单个工具结果长度上限（字符），超过则智能截断 */
-const TOOL_RESULT_MAX = 2000
+const TOOL_RESULT_MAX = 12000
 
 /**
  * 超长工具结果智能截断：
- * - read_file / run_command：保留前 50 行
- * - search_files：保留前 20 条匹配
+ * - read_file：保留前 500 行（大部分源文件可一次读完，避免分页浪费轮次）
+ * - run_command：保留前 200 行
+ * - search_files：保留前 30 条匹配
  * - 其他：截断超长字符串字段
  */
 function truncateToolResult(name: string, result: Record<string, unknown>): Record<string, unknown> {
@@ -344,18 +345,18 @@ function truncateToolResult(name: string, result: Record<string, unknown>): Reco
   if (name === 'read_file' && typeof result.content === 'string') {
     const text = result.content as string
     const lines = text.split('\n')
-    const content = lines.length > 50
-      ? lines.slice(0, 50).join('\n') + `\n... (truncated，共 ${lines.length} 行，可用 start_line/end_line 分段继续读取)`
+    const content = lines.length > 500
+      ? lines.slice(0, 500).join('\n') + `\n... (truncated，共 ${lines.length} 行，可用 start_line/end_line 分段继续读取)`
       : text.slice(0, TOOL_RESULT_MAX) + '\n... (truncated)'
     return { ...result, content, truncated: true }
   }
 
-  if (name === 'search_files' && Array.isArray(result.matches) && result.matches.length > 20) {
+  if (name === 'search_files' && Array.isArray(result.matches) && result.matches.length > 30) {
     return {
       ...result,
-      matches: result.matches.slice(0, 20),
+      matches: result.matches.slice(0, 30),
       truncated: true,
-      note: `仅保留前 20 条匹配（共 ${result.matches.length} 条），请缩小搜索范围或换更精确的关键字`,
+      note: `仅保留前 30 条匹配（共 ${result.matches.length} 条），请缩小搜索范围或换更精确的关键字`,
     }
   }
 
@@ -365,8 +366,8 @@ function truncateToolResult(name: string, result: Record<string, unknown>): Reco
       const v = out[key]
       if (typeof v !== 'string' || v.length <= TOOL_RESULT_MAX / 2) continue
       const lines = v.split('\n')
-      out[key] = lines.length > 50
-        ? lines.slice(0, 50).join('\n') + `\n... (truncated，共 ${lines.length} 行)`
+      out[key] = lines.length > 200
+        ? lines.slice(0, 200).join('\n') + `\n... (truncated，共 ${lines.length} 行)`
         : v.slice(0, TOOL_RESULT_MAX / 2) + '\n... (truncated)'
     }
     return out

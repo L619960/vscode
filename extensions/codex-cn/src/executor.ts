@@ -164,7 +164,7 @@ async function execRead(call: ToolCall): Promise<Record<string, unknown>> {
     const start = Math.max(1, args.start_line || 1)
     const end = Math.min(total, args.end_line || total)
     const slice = lines.slice(start - 1, end)
-    const maxLines = 500
+    const maxLines = 1000
     const truncated = slice.length > maxLines
     const outLines = truncated ? slice.slice(0, maxLines) : slice
     const content = outLines.map((l, i) => `${start + i}| ${l}`).join('\n')
@@ -375,8 +375,7 @@ async function execWriteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<s
 }
 
 /** search/replace：精确 indexOf，行尾空白宽松兜底，多处匹配拒绝 */
-function applyEdits(content: string, edits: Array<{ search: string; replace: string }>):
-  { ok: true; text: string; edits_applied: number } | { ok: false; error: string } {
+function applyEdits(content: string, edits: Array<{ search: string; replace: string }>): { ok: true; text: string; edits_applied: number } | { ok: false; error: string } {
   let text = content
   for (const ed of edits) {
     let idx = text.indexOf(ed.search)
