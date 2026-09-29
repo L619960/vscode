@@ -34,6 +34,48 @@ function isTruncationError(text: string): boolean {
 }
 
 /**
+ * 判断服务端错误是否为「tool_calls JSON 解析失败」（llama.cpp grammar 阶段）。
+ * 覆盖：parse tool call / invalid string / missing closing quote / unexpected token 等。
+ */
+function isToolCallParseError(text: string): boolean {
+  return /parse tool call|invalid string|missing closing quote|unexpected end|unterminated string|expected .* in tool call|tool call.*parse/i.test(text)
+}
+
+/**
+ * 构造降级到 XML 工具调用协议的消息列表。
+ * 关键：llama.cpp chat template 只处理第一条 system 消息，所以把 XML 协议
+ * 直接合并进第一条 system 的 content，而不是追加第二条 system（会被丢弃）。
+ */
+const XML_INSTRUCTION = [
+  '',
+  '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+  '【工具调用协议 · 强制】当前服务不支持原生 tool_calls，你必须用以下 XML 格式输出工具调用：',
+  '格式：<tool_call name="工具名" args=\'{"key":"value"}\'>content</tool_call>',
+  '规则：',
+  '1. 每次回复只能包含一个 <tool_call>，不要输出其他任何文字',
+  '2. args 用单引号包裹 JSON 对象（避免 JSON 内双引号冲突）',
+  '3. write_file / edit_file 的 content 放在标签内部，可含任意换行和引号，无需转义',
+  '4. 其他工具（run_command / read_file 等）content 留空',
+  '示例1：<tool_call name="write_file" args=\'{"path":"main.py"}\'>print("hello")\nprint("world")</tool_call>',
+  '示例2：<tool_call name="run_command" args=\'{"command":"dir"}\'></tool_call>',
+  '示例3：<tool_call name="read_file" args=\'{"path":"main.py"}\'></tool_call>',
+  '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+].join('\n')
+
+function buildXmlDegradedMessages(messages: ChatMessage[]): ChatMessage[] {
+  const degraded = messages.map((m, idx) => {
+    if (idx === 0 && m.role === 'system') {
+      return { role: 'system' as const, content: (m.content || '') + XML_INSTRUCTION }
+    }
+    return m
+  })
+  if (degraded[0]?.role !== 'system') {
+    degraded.unshift({ role: 'system', content: XML_INSTRUCTION })
+  }
+  return degraded
+}
+
+/**
  * 流式对话补全
  * @param opts.messages OpenAI 消息数组
  * @param opts.tools 工具 schema
@@ -58,10 +100,10 @@ export async function chatCompletion(opts: {
   }
 
   const url = `${config.baseUrl.replace(/\/$/, '')}/chat/completions`
-  const makeBody = (withTools: boolean): string =>
+  const makeBody = (withTools: boolean, msgs: ChatMessage[] = messages): string =>
     JSON.stringify({
       model: config.model,
-      messages,
+      messages: msgs,
       stream: true,
       // 8192 上限：既够单文件代码生成（约 6KB），又限制小模型无限发散思考链（过度思考）
       max_tokens: 8192,
@@ -69,14 +111,17 @@ export async function chatCompletion(opts: {
     })
 
   let withTools = config.supportsTools !== false && !!tools?.length
+  // 若一开始就禁用 tools（持久化降级），直接在 system 注入 XML 协议，无需等 400/500
+  const initialMessages = withTools ? messages : buildXmlDegradedMessages(messages)
   let resp: Response
   try {
-    resp = await post(url, config.apiKey, makeBody(withTools), signal)
-    // 兼容降级：部分服务收到 tools 直接 400 → 去掉 tools 重试一次
+    resp = await post(url, config.apiKey, makeBody(withTools, initialMessages), signal)
+    // 兼容降级：部分服务收到 tools 直接 400 → 去掉 tools 并注入 XML 协议重试
     if (!resp.ok && withTools && resp.status === 400) {
       withTools = false
       onDegraded?.()
-      resp = await post(url, config.apiKey, makeBody(false), signal)
+      const degradedMessages = buildXmlDegradedMessages(messages)
+      resp = await post(url, config.apiKey, makeBody(false, degradedMessages), signal)
     }
   } catch (e) {
     if ((e as Error).name === 'AbortError') return { content: '', toolCalls: [], finishReason: null, degraded: false, aborted: true }
@@ -86,7 +131,7 @@ export async function chatCompletion(opts: {
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '')
     // llama.cpp 服务端 500 重试一次（采样有随机性；本地模型生成长 JSON 时偶发格式错误）
-    if (resp.status === 500 && errText.includes('parse tool call')) {
+    if (resp.status === 500 && isToolCallParseError(errText)) {
       await new Promise(r => setTimeout(r, 800))
       try {
         const retryResp = await post(url, config.apiKey, makeBody(withTools), signal)
@@ -94,11 +139,32 @@ export async function chatCompletion(opts: {
           resp = retryResp
         } else {
           const retryText = await retryResp.text().catch(() => '')
-          const truncated = isTruncationError(errText) || isTruncationError(retryText)
-          return {
-            content: '', toolCalls: [], finishReason: null, degraded: false,
-            error: `API 错误 ${retryResp.status}: ${retryText.slice(0, 300)}`,
-            truncated,
+          // ★ 重试仍 parse tool call 失败：降级到无 tools 模式。
+          // 弱模型把代码塞进 tool_calls JSON 时，llama.cpp grammar 解析必失败。
+          // 降级后模型在 content 里用 XML 标签输出工具调用，由客户端解析。
+          if (withTools && isToolCallParseError(retryText)) {
+            onDegraded?.()
+            const degradedMessages = buildXmlDegradedMessages(messages)
+            const degResp = await post(url, config.apiKey, makeBody(false, degradedMessages), signal)
+            if (degResp.ok) {
+              resp = degResp
+              withTools = false
+            } else {
+              const degText = await degResp.text().catch(() => '')
+              const truncated = isTruncationError(errText) || isTruncationError(retryText)
+              return {
+                content: '', toolCalls: [], finishReason: null, degraded: true,
+                error: `API 错误 ${degResp.status}: ${degText.slice(0, 300)}`,
+                truncated,
+              }
+            }
+          } else {
+            const truncated = isTruncationError(errText) || isTruncationError(retryText)
+            return {
+              content: '', toolCalls: [], finishReason: null, degraded: false,
+              error: `API 错误 ${retryResp.status}: ${retryText.slice(0, 300)}`,
+              truncated,
+            }
           }
         }
       } catch (e) {

@@ -138,7 +138,7 @@ function activate(context: vscode.ExtensionContext): void {
     if (req.toolName === 'ask_user') {
       // 结构化提问必须等用户回答
     } else if (auto || autoApproved.has(req.toolName)) {
-      return Promise.resolve({ decision: 'allow' })
+      return Promise.resolve({ decision: 'allow', auto: true })
     } else if (req.toolName === 'submit_plan') {
       // 计划确认模式：未开自动审批时人工批准
     }

@@ -6,7 +6,7 @@ import { getLLMConfig } from './config.js'
 import { TOOL_SCHEMAS, CORE_TOOL_SCHEMAS, WRITE_TOOLS, READ_TOOLS, summarizeArgs, summarizeResult, wantsBrowser } from './tools.js'
 import { executeToolCall, type ApprovalDecision, type ApprovalRequest, type ExecHooks, type ToolDeps } from './executor.js'
 import { ErrorPatternMatcher } from './errorPatternMatcher.js'
-import { repairJson, extractFirstCodeBlock } from './jsonRepair.js'
+import { repairJson, extractFirstCodeBlock, parseXmlToolCalls, parseJsonToolCalls } from './jsonRepair.js'
 import { SubAgentManager } from './subAgent.js'
 import { buildSystemPrompt } from './prompt.js'
 import { Session, type SessionMessage, type ToolRun } from './session.js'
@@ -613,6 +613,11 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         deps.onChange()
         continue
       }
+      // ★ 降级持久化：本轮因 tool_calls 解析失败降级到 XML 模式后，后续轮次直接禁 tools，
+      // 避免每轮都走 500→重试→降级 的浪费循环
+      if (result.degraded && llmConfig.supportsTools !== false) {
+        llmConfig.supportsTools = false
+      }
       if (token.isCancellationRequested || abort.signal.aborted) {
         deps.session.save()
         return
@@ -659,6 +664,25 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           ? { tool_calls: result.toolCalls }
           : {}),
       })
+
+      // ★ 降级模式：服务端 tool_calls 解析失败时，模型在 content 里用 <tool_call> XML 或 JSON 输出
+      if (result.toolCalls.length === 0 && result.content) {
+        const xmlCalls = parseXmlToolCalls(result.content)
+        const jsonCalls = xmlCalls.length === 0 ? parseJsonToolCalls(result.content) : []
+        const parsedCalls = xmlCalls.length > 0 ? xmlCalls : jsonCalls
+        if (parsedCalls.length > 0) {
+          result.toolCalls = parsedCalls.map((xc, i) => ({
+            id: `xml_${Date.now()}_${i}`,
+            type: 'function' as const,
+            function: { name: xc.name, arguments: JSON.stringify(xc.args) },
+          }))
+          // 把 content 里的 XML/JSON 工具调用去掉，避免污染对话历史
+          result.content = result.content
+            .replace(/<tool_call[\s\S]*?<\/tool_call>/g, '')
+            .replace(/^\s*[\[{][\s\S]*[\]}]\s*$/g, '')
+            .trim()
+        }
+      }
 
       if (result.toolCalls.length === 0) {
         const isEmpty = !(result.content || '').trim()

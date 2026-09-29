@@ -133,6 +133,8 @@ export interface ApprovalRequest {
 export interface ApprovalDecision {
   decision: 'allow' | 'deny'
   reason?: string
+  /** true 表示自动审批（autoApprove 开启），executor 据此跳过 awaiting 状态 */
+  auto?: boolean
 }
 
 /** 执行钩子：await 时由扩展弹原生审批（含 Diff），同时驱动 webview 卡片状态 */
@@ -394,7 +396,6 @@ async function execWriteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<s
   const pathRel = normalizeRel(args.path)
   let oldContent = ''
   try { oldContent = await readText(toUri(pathRel)) } catch { /* 新文件 */ }
-  hooks.setStatus('awaiting')
   const result = await hooks.requestApproval({
     toolName: 'write_file', argsSummary: summarizeArgs('write_file', args),
     path: pathRel, oldContent, newContent: String(args.content ?? ''),
@@ -402,6 +403,7 @@ async function execWriteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<s
   if (result.decision !== 'allow') {
     return { ok: false, error: `用户拒绝了写入 ${pathRel}${result.reason ? '：' + result.reason : ''}` }
   }
+  if (!result.auto) hooks.setStatus('awaiting')
   try {
     // 写入前保存快照，供「回滚」恢复
     await saveCheckpoint(toUri(pathRel).fsPath)
@@ -457,7 +459,6 @@ async function execEditFile(call: ToolCall, hooks: ExecHooks): Promise<Record<st
   const editRes = applyEdits(content, Array.isArray(args.edits) ? args.edits : [])
   if (!editRes.ok) return editRes
 
-  hooks.setStatus('awaiting')
   const apr = await hooks.requestApproval({
     toolName: 'edit_file', argsSummary: summarizeArgs('edit_file', args),
     path: pathRel, oldContent: content, newContent: editRes.text,
@@ -465,6 +466,7 @@ async function execEditFile(call: ToolCall, hooks: ExecHooks): Promise<Record<st
   if (apr.decision !== 'allow') {
     return { ok: false, error: `用户拒绝了编辑 ${pathRel}${apr.reason ? '：' + apr.reason : ''}` }
   }
+  if (!apr.auto) hooks.setStatus('awaiting')
   try {
     // 写入前保存快照，供「回滚」恢复
     await saveCheckpoint(toUri(pathRel).fsPath)
@@ -492,13 +494,13 @@ async function execDeleteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<
   const isDir = stat.type & vscode.FileType.Directory
   if (isDir && !args.recursive) return { ok: false, error: `${pathRel} 是目录，需传 recursive=true 才能递归删除` }
 
-  hooks.setStatus('awaiting')
   const apr = await hooks.requestApproval({
     toolName: 'delete_file', argsSummary: pathRel, path: pathRel,
   })
   if (apr.decision !== 'allow') {
     return { ok: false, error: `用户拒绝了删除 ${pathRel}${apr.reason ? '：' + apr.reason : ''}` }
   }
+  if (!apr.auto) hooks.setStatus('awaiting')
   try {
     // 删除前保存快照（文件内容或目录内文件清单），供「回滚」恢复
     await saveCheckpoint(uri.fsPath)
@@ -570,7 +572,6 @@ async function execEditNotebook(call: ToolCall, hooks: ExecHooks): Promise<Recor
   }
 
   // 审批（展示变更摘要）
-  hooks.setStatus('awaiting')
   const apr = await hooks.requestApproval({
     toolName: 'edit_notebook', argsSummary: summarizeArgs('edit_notebook', args),
     path: pathRel,
@@ -580,6 +581,7 @@ async function execEditNotebook(call: ToolCall, hooks: ExecHooks): Promise<Recor
   if (apr.decision !== 'allow') {
     return { ok: false, error: `用户拒绝了 notebook 编辑${apr.reason ? '：' + apr.reason : ''}` }
   }
+  if (!apr.auto) hooks.setStatus('awaiting')
 
   try {
     await saveCheckpoint(uri.fsPath)
@@ -613,13 +615,13 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
   const command = String(args.command || '')
   if (!command) return { ok: false, error: 'AI 调用 run_command 时未提供 command 参数' }
   const danger = DANGER_RE.test(command)
-  hooks.setStatus('awaiting')
   const apr = await hooks.requestApproval({
     toolName: 'run_command', argsSummary: summarizeArgs('run_command', args), command, danger,
   })
   if (apr.decision !== 'allow') {
     return { ok: false, error: `用户拒绝了运行命令${apr.reason ? '：' + apr.reason : ''}` }
   }
+  if (!apr.auto) hooks.setStatus('awaiting')
   const cwdRel = normalizeRel(args.cwd || '.')
   const cwdUri = cwdRel === '' ? rootUri() : toUri(cwdRel)
   const cwdPath = cwdUri.fsPath
@@ -730,11 +732,11 @@ async function execAwaitShell(call: ToolCall, hooks: ExecHooks, deps: ToolDeps):
       const command = String(args.command || '')
       if (!command) return { ok: false, error: 'await_shell start 缺少 command 参数' }
       const danger = DANGER_RE.test(command)
-      hooks.setStatus('awaiting')
       const apr = await hooks.requestApproval({
         toolName: 'await_shell', argsSummary: summarizeArgs('await_shell', args), command, danger,
       })
       if (apr.decision !== 'allow') return { ok: false, error: `用户拒绝了后台命令${apr.reason ? '：' + apr.reason : ''}` }
+      if (!apr.auto) hooks.setStatus('awaiting')
       const cwdRel = normalizeRel(args.cwd || '.')
       const cwdUri = cwdRel === '' ? rootUri() : toUri(cwdRel)
       return { ok: true, ...deps.bgShell.start(command, cwdUri.fsPath) }
