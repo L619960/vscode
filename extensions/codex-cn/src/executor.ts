@@ -21,6 +21,34 @@ const DANGER_RE = /\b(rm\s+-rf|del\s+\/s|format|shutdown|rd\s+\/s|erase\s+\/s)\b
 const BINARY_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.ico', '.exe', '.dll', '.zip', '.woff', '.woff2', '.ttf', '.pdf', '.mp3', '.mp4', '.webm'])
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'dist-electron', '.vscode', '.idea'])
 
+// ---- 文件读取指纹缓存：拦截"反复读同一文件同一范围"的瘫痪循环 ----
+// key = path:start:end，value = 文件 mtime（mtime 不变即内容未变）
+const fileReadCache = new Map<string, number>()
+/** 读文件前检查：同范围同 mtime → 返回提示而非内容，强制模型推进而非重读 */
+async function checkReadCache(relPath: string, start: number, end: number): Promise<string | null> {
+  const key = `${relPath}:${start}:${end}`
+  const cachedMtime = fileReadCache.get(key)
+  if (cachedMtime === undefined) return null
+  try {
+    const stat = await vscode.workspace.fs.stat(toUri(relPath))
+    if (stat.mtime === cachedMtime) {
+      return '【缓存提示】你已读取过该文件此范围，内容自上次读取后未变更。请勿重复读取；如需修改请用 edit_file，需查看其他部分请用不同的 start_line/end_line。'
+    }
+  } catch { /* 文件已删除，放行让上层报不存在 */ }
+  return null
+}
+/** 写入 mtime 缓存 */
+function markReadCache(relPath: string, start: number, end: number, mtime: number): void {
+  fileReadCache.set(`${relPath}:${start}:${end}`, mtime)
+}
+/** 写/改/删成功后失效该文件所有范围的缓存 */
+function invalidateReadCache(relPath: string): void {
+  const prefix = `${relPath}:`
+  for (const k of fileReadCache.keys()) {
+    if (k.startsWith(prefix)) fileReadCache.delete(k)
+  }
+}
+
 // ---- Python 安装发现（PATH 可能缺失/编码损坏，导致 AI 的 python 命令全部失败）----
 let cachedPython: string | null | undefined
 
@@ -159,14 +187,26 @@ async function execRead(call: ToolCall): Promise<Record<string, unknown>> {
   try {
     const ext = '.' + String(args.path).split('.').pop()?.toLowerCase()
     if (BINARY_EXT.has(ext)) return { ok: false, error: '二进制文件不支持读取' }
+    const relPath = normalizeRel(args.path)
+    // 先读内容拿到真实总行数（start/end 依赖 total）
     const text = await readText(toUri(args.path))
     const lines = text.split('\n')
     const total = lines.length
     const start = Math.max(1, args.start_line || 1)
     const end = Math.min(total, args.end_line || total)
+    // 指纹缓存：同文件同范围且 mtime 未变 → 拦截，强制推进而非重读
+    const cachedHint = await checkReadCache(relPath, start, end)
+    if (cachedHint) {
+      return { ok: false, error: cachedHint, total_lines: total, start_line: start, end_line: end }
+    }
+    // 记录本次读取的 mtime
+    try {
+      const stat = await vscode.workspace.fs.stat(toUri(args.path))
+      markReadCache(relPath, start, end, stat.mtime)
+    } catch { /* 忽略，缓存不写入即可 */ }
     const slice = lines.slice(start - 1, end)
     const content = slice.map((l, i) => `${start + i}| ${l}`).join('\n')
-    return { ok: true, path: normalizeRel(args.path), total_lines: total, content, start_line: start, truncated: false }
+    return { ok: true, path: relPath, total_lines: total, content, start_line: start, end_line: end, truncated: false }
   } catch (e) {
     return { ok: false, error: (e as Error).message }
   }
@@ -358,6 +398,7 @@ async function execWriteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<s
     await saveCheckpoint(toUri(pathRel).fsPath)
     const newContent = String(args.content ?? '')
     await vscode.workspace.fs.writeFile(toUri(pathRel), new TextEncoder().encode(newContent))
+    invalidateReadCache(pathRel)
     return {
       ok: true, path: pathRel, bytes: new TextEncoder().encode(newContent).length,
       // 行数统计：供时间线「+N -M」变更卡片展示
@@ -419,6 +460,7 @@ async function execEditFile(call: ToolCall, hooks: ExecHooks): Promise<Record<st
     // 写入前保存快照，供「回滚」恢复
     await saveCheckpoint(toUri(pathRel).fsPath)
     await vscode.workspace.fs.writeFile(toUri(pathRel), new TextEncoder().encode(editRes.text))
+    invalidateReadCache(pathRel)
     // 行数统计：供时间线「+N -M」变更卡片展示
     const edits = Array.isArray(args.edits) ? args.edits : []
     const linesAdded = edits.reduce((n: number, e: any) => n + String(e.replace ?? '').split('\n').length, 0)
@@ -452,6 +494,10 @@ async function execDeleteFile(call: ToolCall, hooks: ExecHooks): Promise<Record<
     // 删除前保存快照（文件内容或目录内文件清单），供「回滚」恢复
     await saveCheckpoint(uri.fsPath)
     await vscode.workspace.fs.delete(uri, { recursive: !!args.recursive, useTrash: false })
+    // 失效该路径（含目录下所有子文件）的读取缓存
+    for (const k of fileReadCache.keys()) {
+      if (k.startsWith(pathRel + ':') || k.startsWith(pathRel + '/')) fileReadCache.delete(k)
+    }
     return { ok: true, path: pathRel, deleted: true }
   } catch (e) {
     return { ok: false, error: `删除失败: ${(e as Error).message}` }
