@@ -461,6 +461,7 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
     let confirmBlocked = 0 // "请确认"零产出收尾拦截次数（最多 2 次防死循环）
     let stagnantActionRounds = 0 // 连续"只读/规划无推进"轮数
     let stagnantWarned = 0 // 行动催办次数（最多 2 次防刷屏）
+    let deliveryRemindCount = 0 // 交付闸门拦截次数（冒烟通过后仍规划时强制汇报，最多 2 次）
     for (let round = 1; round <= MAX_ROUNDS; round++) {
       if (token.isCancellationRequested || abort.signal.aborted) return
 
@@ -626,6 +627,23 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
             ? `[系统] 验证闸门：你修改了 ${modifiedPaths.size} 个文件（${files}${modifiedPaths.size > 5 ? ' 等' : ''}），但修改后未运行任何验证。请先用 run_command 运行构建/测试/冒烟脚本（GUI 程序用冒烟脚本实例化后销毁，禁止直接跑主入口），或用 read_lints 检查诊断；确认无报错后再收尾汇报。`
             : `[系统] 验证闸门（第 2 次拦截）：你仍未在最后一次修改后跑通任何验证。请立即按错误信息修复并重跑验证；如果验证确实因环境限制无法通过，必须把完整错误信息、失败原因和当前真实完成度如实汇报后才能收尾，禁止假装验证通过、禁止退回重规划。`
           messages.push({ role: 'user', content })
+          deps.session.save()
+          deps.onChange()
+          continue
+        }
+        // ★交付闸门：冒烟已通过（验证在最后一次修改之后），模型却输出纯规划文本（无工具调用）而非交付汇报——
+        // 检测"计划/规划/Phase/实施"类措辞，强制直接输出三段式交付汇报（允许拦截 2 次）
+        const deliveryReady = modifiedPaths.size > 0 && lastVerifyRound >= lastModifyRound
+        const looksLikePlanning = /(实施计划|开发计划|详细计划|制定计划|Phase\s*\d|规划阶段|下一步计划|我将制定|创建.*计划文件)/.test(result.content)
+        if (deliveryReady && looksLikePlanning && deliveryRemindCount < 2) {
+          deliveryRemindCount++
+          messages.pop()
+          deps.session.remove(assistantMsg)
+          const files = [...modifiedPaths].slice(0, 6).join('、')
+          messages.push({
+            role: 'user',
+            content: `[系统·交付闸门] 冒烟验证已通过（第 ${lastVerifyRound} 轮）、产物文件（${files}）已就绪，功能已闭环，无需再制定任何实施计划。本轮必须直接输出最终交付汇报，严格三段式：1) 修改内容（列出文件与功能点）2) 验证方式（冒烟命令与结果，如实）3) 当前状态（完成度、已知限制、运行方式）。禁止再输出计划/规划/Phase 类文本，禁止再加载技能，禁止再调用工具。`,
+          })
           deps.session.save()
           deps.onChange()
           continue
@@ -879,6 +897,18 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           // ★技能加载：load_skill 由 runAgent 特殊处理（直接读 SkillsStore，内容作为工具结果进入上下文）
           if (tname === 'load_skill') {
             const rawName = String(args.name || '').trim()
+            // ★交付闸门：冒烟已通过后，禁止再加载规划类技能（writing-plans/brainstorming 等），强制直接交付
+            const deliveryReady = modifiedPaths.size > 0 && lastVerifyRound >= lastModifyRound
+            const PLANNING_SKILLS = /writing-plans|brainstorming|test-driven-development|code-review|plan-mode|spec-mode/i
+            if (deliveryReady && PLANNING_SKILLS.test(rawName)) {
+              run.status = 'done'
+              run.resultJson = JSON.stringify({ ok: true, name: rawName, note: '冒烟验证已通过、功能已闭环，无需再加载规划类技能。请立即输出最终交付汇报（修改内容/验证方式/当前状态），不要继续规划。' })
+              run.resultSummary = `交付闸门：跳过「${rawName}」`
+              messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+              deps.session.save()
+              deps.onChange()
+              continue
+            }
             // vendor 技能附属文件（如 references/xxx.md）；个人技能不用此参数
             const vendorFile = args.file ? String(args.file).trim() : undefined
             const fileName = rawName.endsWith('.md') ? rawName : `${rawName}.md`
