@@ -64,10 +64,12 @@ const XML_INSTRUCTION = [
 
 function buildXmlDegradedMessages(messages: ChatMessage[]): ChatMessage[] {
   const degraded = messages.map((m, idx) => {
+    // 降级模式下剥离 tool_calls / tool_call_id，防止服务端 400
+    const base: ChatMessage = { role: m.role, content: m.content }
     if (idx === 0 && m.role === 'system') {
       return { role: 'system' as const, content: (m.content || '') + XML_INSTRUCTION }
     }
-    return m
+    return base
   })
   if (degraded[0]?.role !== 'system') {
     degraded.unshift({ role: 'system', content: XML_INSTRUCTION })
@@ -100,15 +102,18 @@ export async function chatCompletion(opts: {
   }
 
   const url = `${config.baseUrl.replace(/\/$/, '')}/chat/completions`
-  const makeBody = (withTools: boolean, msgs: ChatMessage[] = messages): string =>
-    JSON.stringify({
+  const makeBody = (withTools: boolean, msgs: ChatMessage[] = messages): string => {
+    // 无 tools 模式下剥离 tool_calls/tool_call_id，防止服务端 400
+    const cleanMsgs = withTools ? msgs : msgs.map(m => ({ role: m.role, content: m.content }))
+    return JSON.stringify({
       model: config.model,
-      messages: msgs,
+      messages: cleanMsgs,
       stream: true,
       // 16384 上限：支持大文件生成（如完整 Vue 组件/长代码），避免 write_file 参数截断
       max_tokens: 16384,
       ...(withTools && tools?.length ? { tools, tool_choice: 'auto' } : {}),
     })
+  }
 
   let withTools = config.supportsTools !== false && !!tools?.length
   // 若一开始就禁用 tools（持久化降级），直接在 system 注入 XML 协议，无需等 400/500
