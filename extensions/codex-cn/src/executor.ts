@@ -208,7 +208,8 @@ async function execRead(call: ToolCall): Promise<Record<string, unknown>> {
     // 指纹缓存：同文件同范围且 mtime 未变 → 拦截，强制推进而非重读
     const cachedHint = await checkReadCache(relPath, start, end)
     if (cachedHint) {
-      return { ok: false, error: cachedHint, total_lines: total, start_line: start, end_line: end }
+      // 缓存命中不是错误，返回 ok=true + cached=true，让前端显示为提示而非失败
+      return { ok: true, cached: true, hint: cachedHint, total_lines: total, start_line: start, end_line: end }
     }
     // 记录本次读取的 mtime
     try {

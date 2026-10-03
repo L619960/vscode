@@ -664,6 +664,8 @@ export function summarizeArgs(name: string, args: Record<string, unknown>): stri
 export function summarizeResult(name: string, result: Record<string, unknown>): string {
   if (!result || typeof result !== 'object') return ''
   if (result.ok === false) return String(result.error || '失败')
+  // 缓存命中：返回提示而非"失败"
+  if (result.cached === true) return String(result.hint || '内容未变更（已缓存）')
   switch (name) {
     case 'list_dir':
       return `${(result.entries as unknown[])?.length ?? 0} 个条目${result.truncated ? '（已截断）' : ''}`
