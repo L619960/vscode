@@ -93,6 +93,7 @@
           "default": "doubao",
           "enum": [
             "doubao",
+            "volcesPlan",
             "deepseek",
             "qwen",
             "kimi",
@@ -104,6 +105,7 @@
           ],
           "enumDescriptions": [
             "豆包",
+            "火山引擎 Coding Plan",
             "DeepSeek",
             "通义千问",
             "Kimi",

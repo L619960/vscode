@@ -257,7 +257,9 @@ function activate(context: vscode.ExtensionContext): void {
     privacyMode?: boolean; maxMessages?: number; autoTitle?: boolean; maxSessions?: number
   }
   const saveConfig = async (patch: ConfigPatch): Promise<void> => {
+    let providerChanged = false
     if (patch.provider && patch.provider !== getProvider()) {
+      providerChanged = true
       await setConfig({ provider: patch.provider })
       await applyProviderPreset(patch.provider)
     }
@@ -280,6 +282,8 @@ function activate(context: vscode.ExtensionContext): void {
     if (patch.maxSessions !== undefined) rest.maxSessions = patch.maxSessions
     if (Object.keys(rest).length) await setConfig(rest)
     if (patch.apiKey) await saveApiKey(context.secrets, patch.apiKey)
+    // 切换提供商：预填的 baseUrl/model 需回传 webview 刷新表单，否则用户看到的是旧值
+    if (providerChanged) void postToWebview({ type: 'config', data: await getConfig() })
     // 会话上限调小：立即淘汰并广播最新会话列表
     if (patch.maxSessions !== undefined || patch.maxMessages !== undefined) {
       manager.applyLimits()
