@@ -253,6 +253,8 @@ export interface AgentDeps {
   saveUserMemory?: (content: string) => Promise<void>
   /** 跨会话用户记忆读取（启动时注入） */
   getUserMemory?: () => Promise<string>
+  /** 推送执行阶段到 UI（thinking/tool_call/tool_result/responding） */
+  onPhase?: (phase: string, detail?: string) => void
 }
 
 /** 2 层目录摘要 */
@@ -764,6 +766,7 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
       }
       // ★ 降级持久化：本轮因 tool_calls 解析失败降级到 XML 模式后，后续轮次直接禁 tools，
       // 避免每轮都走 500→重试→降级 的浪费循环
+      deps.onPhase?.('thinking', `第 ${round} 轮`)
       if (result.degraded && llmConfig.supportsTools !== false) {
         llmConfig.supportsTools = false
       }
@@ -1133,6 +1136,7 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
             setStatus: (s) => { run!.status = s as ToolRun['status']; deps.onChange() },
             requestApproval: (req) => deps.requestApproval(req),
           }
+          deps.onPhase?.('tool_call', call.function.name)
 
           // 超规模硬拦截：不执行工具，回喂分批写入指令
           const sizeError = enforceWriteSizePolicy(call.function.name, args)
@@ -1464,6 +1468,7 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
           }
           deps.session.save()
           deps.onChange()
+          deps.onPhase?.('tool_result', run.resultSummary)
 
           messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(toolResult) })
         } catch (e) {
@@ -1519,5 +1524,6 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
       lastAssistantMsg.endTs = Date.now()
       deps.session.save()
     }
+    deps.onPhase?.('responding', '完成')
   }
 }

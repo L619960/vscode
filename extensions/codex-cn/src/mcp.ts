@@ -368,6 +368,18 @@ export class McpManager {
     })
   }
 
+  /** 状态行摘要：🟢 6/6 MCP 已连接 或 🟡 3/6 连接中 或 🔴 2/6 失败 */
+  statusLine(): string {
+    const all = this.list()
+    const total = all.length
+    if (!total) return ''
+    const ok = all.filter(s => s.status === 'connected').length
+    const err = all.filter(s => s.status === 'error').length
+    if (ok === total) return `🟢 ${ok}/${total} MCP 已连接`
+    if (err === total) return `🔴 ${ok}/${total} MCP 连接失败`
+    return `🟡 ${ok}/${total} MCP 连接中`
+  }
+
   /** 转成 OpenAI function-calling schema 列表 */
   toolSchemas(): Array<{ type: 'function'; function: { name: string; description: string; parameters: Record<string, unknown> } }> {
     return [...this.toolMap.values()].map(t => ({

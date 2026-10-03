@@ -30,6 +30,21 @@ body {
 .chat-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .msg-list { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
 
+/* 阶段指示器 + MCP 状态灯 */
+.phase-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 12px; font-size: 11.5px;
+  background: var(--vscode-textCodeBlock-background, rgba(110,118,129,0.15));
+  border-bottom: 1px solid var(--vscode-panel-border, #2b2b2b);
+  flex-shrink: 0;
+}
+.phase-indicator { opacity: 0.9; }
+.mcp-status {
+  margin-left: auto; opacity: 0.75; font-size: 10.5px;
+  padding: 2px 6px; border-radius: 4px;
+  background: var(--vscode-panel-border, rgba(128,128,128,0.15));
+}
+
 .empty { text-align: center; margin-top: 40px; opacity: 0.85; }
 .empty p { font-size: 15px; margin-bottom: 6px; }
 .empty span { font-size: 11.5px; opacity: 0.6; }

@@ -204,6 +204,7 @@ function activate(context: vscode.ExtensionContext): void {
       getApiKey: () => getApiKey(context.secrets),
       requestApproval,
       onChange: () => postState(),
+      onPhase: (phase, detail) => postToWebview({ type: 'phase', phase, detail, mcpStatus: mcp.statusLine() }),
       toolDeps: { board, bgShell, browser },
       subAgents,
       taskBoard: board,

@@ -1,8 +1,7 @@
 <script setup lang="ts">
-// 对话视图：消息流 + 工具卡片（含审批按钮）+ 输入区
+// 对话视图：消息流 + 工具卡片 + 阶段指示 + 输入区
 import { ref, computed, onMounted, nextTick, watch, type Ref } from 'vue'
 import { vscodeApi } from '../main'
-import AgentPermissionPop from './AgentPermissionPop.vue'
 import AgentSelectPop from './AgentSelectPop.vue'
 
 interface ToolRun {
@@ -21,19 +20,8 @@ interface Msg {
   endTs?: number
   toolRuns?: ToolRun[]
 }
-interface Approval {
-  id: string
-  toolName: string
-  argsSummary: string
-  command?: string
-  danger?: boolean
-  path?: string
-  oldContent?: string
-  newContent?: string
-  /** kind=ask：ask_user 结构化提问卡片（选项按钮 + 自由输入） */
-  kind?: 'tool' | 'ask'
-  options?: string[]
-}
+/** 执行阶段：thinking（LLM 生成中）/ tool_call（执行工具）/ tool_result（回喂结果）/ responding（生成回复） */
+type AgentPhase = 'thinking' | 'tool_call' | 'tool_result' | 'responding' | null
 
 // ---- Cursor 风格时间线：按用户消息把会话切成回合 ----
 interface ToolGroup {
@@ -76,12 +64,15 @@ interface Segment {
 const messages = ref<Msg[]>([])
 const running = ref(false)
 const input = ref('')
-const approvals = ref<Array<Approval & { runKey: string }>>([])
 // 可回滚的快照数量（>0 时显示回滚按钮）
 const checkpoints = ref(0)
 // AI 主动任务规划（todo_write）
 const todos = ref<TaskCheckpoint[]>([])
 const planClosed = ref(false)
+// 当前执行阶段（ thinking / tool_call / tool_result / responding ）
+const currentPhase = ref<AgentPhase>(null)
+const phaseDetail = ref('')
+const mcpStatus = ref('')
 /** 规划完成度统计 */
 const planStats = computed(() => ({
   total: todos.value.length,
@@ -272,25 +263,17 @@ const showWaiting = computed<boolean>(() => {
   return last.nodes.length === 0 && !last.finalReply
 })
 
-/** 把待审批请求关联到唯一的 awaiting run（工具串行执行，同时只有一个） */
-function attachApprovals(): void {
-  for (const a of approvals.value) {
-    const run = findAwaitingRun(a.toolName, a.argsSummary)
-    if (run) a.runKey = run.id
+/** 阶段指示器文案 */
+const phaseLabel = computed(() => {
+  if (!currentPhase.value) return ''
+  const map: Record<string, string> = {
+    thinking: '💭 思考中',
+    tool_call: '🔧 执行工具',
+    tool_result: '📥 结果回喂',
+    responding: '💬 生成回复',
   }
-}
-function findAwaitingRun(toolName: string, argsSummary: string): ToolRun | undefined {
-  for (let i = messages.value.length - 1; i >= 0; i--) {
-    for (const t of messages.value[i].toolRuns || []) {
-      // submit_plan 的审批 argsSummary 是方案全文，与 run 上截断的摘要不一致，按名称匹配即可（工具串行执行，同时只有一个 awaiting）
-      if (t.status === 'awaiting' && t.name === toolName && (toolName === 'submit_plan' || t.argsSummary === argsSummary)) return t
-    }
-  }
-  return undefined
-}
-function approvalFor(run: ToolRun): Approval | undefined {
-  return approvals.value.find((a) => a.runKey === run.id)
-}
+  return map[currentPhase.value] || currentPhase.value
+})
 
 onMounted(() => {
   window.addEventListener('message', (e: MessageEvent) => {
@@ -303,16 +286,13 @@ onMounted(() => {
       if (m.sessions) sessions.value = m.sessions
       if (m.activeId !== undefined) activeId.value = m.activeId
       if (todos.value.length) planClosed.value = false
-      // 清理已完成审批
-      approvals.value = approvals.value.filter((a) => !!findAwaitingRun(a.toolName, a.argsSummary))
-      attachApprovals()
+    } else if (m.type === 'phase') {
+      currentPhase.value = m.phase as AgentPhase
+      phaseDetail.value = m.detail || ''
+      if (m.mcpStatus) mcpStatus.value = m.mcpStatus
     } else if (m.type === 'sessions') {
       sessions.value = m.sessions || []
       activeId.value = m.activeId
-    } else if (m.type === 'approval') {
-      const { type, id, ...req } = m
-      approvals.value.push({ id, ...(req as Omit<Approval, 'id'>), runKey: '' })
-      attachApprovals()
     } else if (m.type === 'workspaceFiles') {
       // 过期响应丢弃（seq 不同说明用户又输入了新字符）
       if (m.seq === fileSeq) fileItems.value = m.files || []
@@ -566,33 +546,6 @@ function onKeydown(e: KeyboardEvent): void {
   }
 }
 
-const rejectMode = ref<Record<string, boolean>>({})
-const rejectReason = ref('')
-function decide(a: Approval, decision: string, extra?: { viewDiff?: boolean }): void {
-  if (decision === 'deny' && !rejectMode.value[a.id]) { rejectMode.value[a.id] = true; return }
-  // postMessage 走结构化克隆，Vue 响应式 Proxy 无法克隆（DataCloneError 会被静默吞掉），
-  // 必须转成纯对象再发送，否则审批决定永远到不了扩展侧
-  const plain = JSON.parse(JSON.stringify(a)) as Approval
-  vscodeApi.postMessage({
-    type: 'decision', id: plain.id, decision,
-    reason: rejectReason.value.trim() || undefined,
-    viewDiff: extra?.viewDiff, req: plain,
-  })
-  rejectMode.value[a.id] = false
-  rejectReason.value = ''
-}
-
-const hasDiff = (a: Approval): boolean => a.oldContent !== undefined && a.newContent !== undefined
-
-/** ask_user 提问卡片：选项点击或自由输入后把回答作为 reason 回传（decision=allow） */
-const askInput = ref<Record<string, string>>({})
-function decideAsk(a: Approval, answer: string): void {
-  const text = String(answer || '').trim()
-  if (!text) return
-  const plain = JSON.parse(JSON.stringify(a)) as Approval
-  vscodeApi.postMessage({ type: 'decision', id: plain.id, decision: 'allow', reason: text, req: plain })
-  askInput.value[plain.id] = ''
-}
 const statusText = computed(() => (running.value ? '停止' : '发送'))
 
 // 自动滚动到底部
@@ -681,6 +634,12 @@ watch(running, (now, prev) => {
           </svg>
         </button>
       </div>
+    </div>
+
+    <!-- 阶段指示器 + MCP 状态灯 -->
+    <div v-if="running" class="phase-bar">
+      <span class="phase-indicator">{{ phaseLabel }}<template v-if="phaseDetail"> · {{ phaseDetail }}</template></span>
+      <span v-if="mcpStatus" class="mcp-status" title="MCP 工具服务器连接状态">{{ mcpStatus }}</span>
     </div>
 
     <div class="msg-list" ref="msgListEl">
@@ -847,42 +806,15 @@ watch(running, (now, prev) => {
                   </div>
                 </div>
 
-                <!-- 执行中 / 待审批（不聚合，实时呈现） -->
+                <!-- 执行中（不聚合，实时呈现） -->
                 <div v-else class="step">
                   <div class="step-rail"><span class="step-ico pending">{{ GROUP_ICONS[node.run.name] || '🔧' }}</span></div>
                   <div class="step-main">
                     <div class="step-title" :class="node.run.status">
                       {{ TOOL_LABELS[node.run.name] || node.run.name }} {{ node.run.argsSummary }}
-                      <span class="gd-badge" :class="node.run.status">{{ node.run.status === 'awaiting' ? '待批准' : '执行中' }}</span>
+                      <span class="gd-badge" :class="node.run.status">执行中</span>
                     </div>
                     <div v-if="node.run.resultSummary" class="gd-result">{{ node.run.resultSummary }}</div>
-                    <!-- ask_user 提问卡片：问题 + 选项按钮 + 自由输入 -->
-                    <template v-if="node.run.status === 'awaiting' && approvalFor(node.run)?.kind === 'ask'">
-                      <div class="ask-card">
-                        <div class="ask-q">{{ approvalFor(node.run)!.argsSummary }}</div>
-                        <div v-if="approvalFor(node.run)!.options?.length" class="ask-options">
-                          <button v-for="opt in approvalFor(node.run)!.options" :key="opt" class="mini ask-opt" @click="decideAsk(approvalFor(node.run)!, opt)">{{ opt }}</button>
-                        </div>
-                        <div class="reject-row">
-                          <input v-model="askInput[approvalFor(node.run)!.id]" placeholder="或输入你的回答…" @keydown.enter="decideAsk(approvalFor(node.run)!, askInput[approvalFor(node.run)!.id] || '')" />
-                          <button class="mini primary" @click="decideAsk(approvalFor(node.run)!, askInput[approvalFor(node.run)!.id] || '')">回答</button>
-                        </div>
-                      </div>
-                    </template>
-                    <!-- 审批按钮 -->
-                    <template v-else-if="node.run.status === 'awaiting' && approvalFor(node.run)">
-                      <div class="tc-actions" v-if="!rejectMode[approvalFor(node.run)!.id]">
-                        <button class="mini primary" @click="decide(approvalFor(node.run)!, 'allow')">允许</button>
-                        <button class="mini" @click="decide(approvalFor(node.run)!, 'deny')">拒绝</button>
-                        <button class="mini" @click="decide(approvalFor(node.run)!, 'always')">本次会话免审批</button>
-                        <button v-if="hasDiff(approvalFor(node.run)!)" class="mini" @click="decide(approvalFor(node.run)!, 'allow', { viewDiff: true })">查看 Diff</button>
-                        <span v-if="approvalFor(node.run)?.danger" class="danger-tag">⚠ 危险命令</span>
-                      </div>
-                      <div v-else class="reject-row">
-                        <input v-model="rejectReason" placeholder="拒绝原因（可选，会反馈给 AI）" @keydown.enter="decide(approvalFor(node.run)!, 'deny')" />
-                        <button class="mini primary" @click="decide(approvalFor(node.run)!, 'deny')">确认</button>
-                      </div>
-                    </template>
                   </div>
                 </div>
               </template>
