@@ -80,6 +80,137 @@ function detectLoop(text: string): boolean {
   return false
 }
 
+// ──────────────────────────────────────────────────────────────
+// 借鉴点 1：OpenHands StuckDetector —— 语义级停滞检测（工具调用指纹）
+// 借鉴点 2：pi-loop-police —— 重读文件/搜索螺旋硬拦截 + recovery 注入
+// ──────────────────────────────────────────────────────────────
+
+/** 工具调用指纹：name + 规范化后的参数（忽略空白/引号差异，抓语义重复） */
+function toolFingerprint(name: string, argsJson: string): string {
+  // 参数按字符排序去空白，消除 `"a":1,"b":2` 与 `{"b":2,"a":1}` 的差异
+  const norm = argsJson.replace(/\s+/g, '')
+  let hash = 0
+  const s = `${name}::${norm}`
+  for (let i = 0; i < s.length; i++) {
+    hash = ((hash << 5) - hash + s.charCodeAt(i)) | 0
+  }
+  return `${name}#${(hash >>> 0).toString(36)}`
+}
+
+/** 错误指纹：去掉路径/行号/时间戳等噪声，只保留错误类型与关键信息 */
+function errorFingerprint(resultJson: string): string {
+  const s = resultJson
+    .replace(/[A-Za-z]:[\\/][^\s"',]+/g, '<PATH>')   // 绝对路径
+    .replace(/\bline\s+\d+/gi, 'line N')               // 行号
+    .replace(/\bat\s+.*?:\d+:\d+/g, 'at <LOC>')        // 堆栈位置
+    .replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/g, '<TS>') // 时间戳
+    .replace(/\s+/g, ' ')
+    .slice(0, 300)
+  return s
+}
+
+/**
+ * 语义级停滞检测器（OpenHands StuckDetector 思路简化版）：
+ * - 模式 A：同一 (工具,参数) 指纹在最近窗口内重复 ≥ N 次 → 工具级死循环
+ * - 模式 B：同一 (工具,参数) 连续报错且错误指纹相同 ≥ M 次 → 同一错误反复
+ * - 模式 C：最近 K 轮全部是只读工具（无 write/run）→ 分析瘫痪（已有，此处补充语义判断）
+ */
+class SemanticStuckDetector {
+  /** 工具调用记录：fingerprint → 出现次数（最近窗口） */
+  private calls = new Map<string, number>()
+  /** (工具指纹 + 错误指纹) → 连续失败次数 */
+  private failures = new Map<string, number>()
+  /** 最近 N 次工具调用指纹（用于模式 A 窗口） */
+  private recentCalls: string[] = []
+  /** 最近 N 轮是否为纯只读 */
+  private readOnlyStreak = 0
+
+  constructor(private windowSize = 8, private callRepeatLimit = 3, private failRepeatLimit = 3) { }
+
+  /** 记录一次工具调用（执行前调用） */
+  recordCall(name: string, argsJson: string): string | null {
+    const fp = toolFingerprint(name, argsJson)
+    this.recentCalls.push(fp)
+    if (this.recentCalls.length > this.windowSize) this.recentCalls.shift()
+    const count = (this.calls.get(fp) || 0) + 1
+    this.calls.set(fp, count)
+    if (count >= this.callRepeatLimit) {
+      return `工具「${name}」的同一参数组合已重复 ${count} 次（指纹 ${fp}），属于工具级死循环。请换不同参数/不同工具，或直接收尾交付。`
+    }
+    // 只读 streak
+    const READ = new Set(['read_file', 'list_dir', 'search_files', 'glob', 'read_lints', 'web_fetch'])
+    if (READ.has(name)) this.readOnlyStreak++
+    else this.readOnlyStreak = 0
+    return null
+  }
+
+  /** 记录工具结果（执行后调用） */
+  recordResult(name: string, argsJson: string, ok: boolean, resultJson: string): string | null {
+    if (ok) {
+      // 成功后清除该指纹的失败计数
+      const fp = toolFingerprint(name, argsJson)
+      this.failures.delete(fp)
+      return null
+    }
+    const fp = toolFingerprint(name, argsJson) + '|' + errorFingerprint(resultJson)
+    const count = (this.failures.get(fp) || 0) + 1
+    this.failures.set(fp, count)
+    if (count >= this.failRepeatLimit) {
+      return `同一错误已连续出现 ${count} 次（错误指纹相同），说明当前修复方向无效。请停下来：1) 分析根因而非表象 2) 换完全不同的方案 3) 若确实无法解决，如实告知用户当前阻塞点。`
+    }
+    return null
+  }
+
+  /** 获取只读连续轮数（供分析瘫痪判断） */
+  getReadOnlyStreak(): number { return this.readOnlyStreak }
+
+  /** 重置（新任务/用户新输入时） */
+  reset(): void {
+    this.calls.clear()
+    this.failures.clear()
+    this.recentCalls = []
+    this.readOnlyStreak = 0
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+// 借鉴点 3：ratchet-sm —— 三级降级链（native→XML→JSON→纯文本）+ prompt_patch 回喂
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * 降级链状态：每轮记录模型输出的"原始格式"，失败时生成 prompt_patch 回喂。
+ * 借鉴 ratchet-sm 的"解析管线 + 校验失败回喂"模式。
+ */
+class DegradationChain {
+  /** 当前降级层级：0=native, 1=XML, 2=JSON, 3=纯文本 */
+  private level = 0
+  /** 各级别连续失败次数 */
+  private failCounts = [0, 0, 0, 0]
+
+  /** 记录一次解析失败，返回应注入的 prompt_patch */
+  recordParseFail(level: number, rawText: string): string {
+    this.failCounts[level] = (this.failCounts[level] || 0) + 1
+    const count = this.failCounts[level]
+    const preview = rawText.slice(0, 120).replace(/\n/g, ' ')
+    if (level === 0) {
+      return `[系统·格式纠正] 第 ${count} 次 native tool_calls 解析失败（预览：${preview}...）。请改用 XML 格式：<tool_call name="工具名" args='{"参数":值}'>content</tool_call>。禁止再输出 JSON。`
+    }
+    if (level === 1) {
+      return `[系统·格式纠正] 第 ${count} 次 XML 解析失败（预览：${preview}...）。请改用简化 JSON 格式：{"name": "工具名", "arguments": {"参数":值}}。禁止再输出 XML 标签。`
+    }
+    if (level === 2) {
+      return `[系统·格式纠正] 第 ${count} 次 JSON 解析失败（预览：${preview}...）。请直接输出纯文本说明要做什么，禁止再输出任何结构化格式。`
+    }
+    return `[系统·格式纠正] 连续 ${count} 次无法解析输出。请直接输出纯文本，不要任何格式标记。`
+  }
+
+  /** 记录一次解析成功，重置该级别失败计数 */
+  recordSuccess(level: number): void { this.failCounts[level] = 0 }
+
+  getLevel(): number { return this.level }
+  setLevel(level: number): void { this.level = level }
+}
+
 /** 截断恢复指令：引导模型用更紧凑的写法或分批 edit */
 const TRUNCATION_RECOVERY = [
   '上一次工具调用因参数内容过长，在生成中途被截断（JSON 不完整，服务端无法解析）。',
@@ -469,6 +600,17 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
   let verifyRemindCount = 0 // 验证闸门拦截次数：允许拦截 2 次，第 3 次放行防死循环
   // 计划确认模式：写/执行类工具必须先 submit_plan 并获用户批准
   let planApproved = !deps.planMode
+
+  // ── 借鉴点 1+2：语义级停滞检测 + 重读/搜索螺旋硬拦截 ──
+  const stuckDetector = new SemanticStuckDetector(8, 3, 3)
+  /** 文件读取缓存：path → 上次读取的 mtime（用于重读硬拦截） */
+  const fileReadCache = new Map<string, number>()
+  /** 搜索查询缓存：query → 出现次数（用于搜索螺旋拦截） */
+  const searchQueryCache = new Map<string, number>()
+
+  // ── 借鉴点 3：三级降级链 + prompt_patch 回喂 ──
+  const degradationChain = new DegradationChain()
+
   try {
     let consecutiveErrors = 0
     let consecutiveEmpty = 0
@@ -667,10 +809,43 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
       // ★ 降级模式：服务端 tool_calls 解析失败时，模型在 content 里用 <tool_call> XML 或 JSON 输出
       // 必须在 push assistant 之前解析，确保 assistant 消息携带 tool_calls
       if (result.toolCalls.length === 0 && result.content) {
-        const xmlCalls = parseXmlToolCalls(result.content)
-        const jsonCalls = xmlCalls.length === 0 ? parseJsonToolCalls(result.content) : []
-        const parsedCalls = xmlCalls.length > 0 ? xmlCalls : jsonCalls
-        if (parsedCalls.length > 0) {
+        // ── 借鉴点 3：ratchet-sm 三级降级链 + prompt_patch 回喂 ──
+        // 优先尝试当前层级格式，失败则降级并记录 prompt_patch
+        let parsedCalls: ReturnType<typeof parseXmlToolCalls> = []
+        let usedLevel = degradationChain.getLevel()
+        let parseFailMsg = ''
+
+        // 尝试 XML 解析（当前层级或更高层级都先尝试）
+        if (usedLevel <= 1) {
+          parsedCalls = parseXmlToolCalls(result.content)
+          if (parsedCalls.length > 0) {
+            usedLevel = 1
+            degradationChain.recordSuccess(1)
+          } else {
+            parseFailMsg = degradationChain.recordParseFail(1, result.content)
+          }
+        }
+
+        // XML 失败 → 尝试 JSON 解析
+        if (parsedCalls.length === 0 && usedLevel <= 2) {
+          parsedCalls = parseJsonToolCalls(result.content)
+          if (parsedCalls.length > 0) {
+            usedLevel = 2
+            degradationChain.recordSuccess(2)
+            degradationChain.setLevel(2)
+          } else if (!parseFailMsg) {
+            parseFailMsg = degradationChain.recordParseFail(2, result.content)
+          }
+        }
+
+        // 都失败 → 降级到纯文本，并注入 prompt_patch
+        if (parsedCalls.length === 0 && parseFailMsg) {
+          degradationChain.setLevel(3)
+          // 把 prompt_patch 作为 system 消息注入，让模型下轮自我纠正
+          messages.push({ role: 'system', content: parseFailMsg })
+          // 纯文本模式：不解析工具，直接返回 content 作为回复
+          result.toolCalls = []
+        } else if (parsedCalls.length > 0) {
           result.toolCalls = parsedCalls.map((xc, i) => ({
             id: `xml_${Date.now()}_${i}`,
             type: 'function' as const,
@@ -826,6 +1001,68 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
               deps.session.save()
               deps.onChange()
               continue
+            }
+          }
+
+          // ── 借鉴点 1：语义级停滞检测（执行前记录指纹，检测工具级死循环）──
+          const callArgsJson = call.function.arguments || '{}'
+          const stuckMsg = stuckDetector.recordCall(call.function.name, callArgsJson)
+          if (stuckMsg) {
+            // 检测到工具级死循环：不执行，直接回喂纠正指令
+            const run: ToolRun = {
+              id: call.id, name: call.function.name, argsSummary: '', argsJson: callArgsJson,
+              status: 'error', resultJson: JSON.stringify({ ok: false, error: stuckMsg, recovery: '换不同参数/不同工具，或直接收尾交付' }),
+              resultSummary: '语义级停滞拦截',
+            }
+            assistantMsg.toolRuns!.push(run)
+            deps.session.save()
+            deps.onChange()
+            messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+            continue
+          }
+
+          // ── 借鉴点 2：pi-loop-police 重读/搜索螺旋硬拦截 ──
+          if (call.function.name === 'read_file' || call.function.name === 'list_dir') {
+            const pathArg = String(JSON.parse(callArgsJson || '{}').path || '').replace(/\//g, '\\').toLowerCase()
+            if (pathArg) {
+              const cached = fileReadCache.get(pathArg)
+              if (cached !== undefined) {
+                // 已读过且未变更（通过 modifiedPaths 判断文件是否被改过）
+                const wasModified = modifiedPaths.has(pathArg)
+                if (!wasModified) {
+                  const run: ToolRun = {
+                    id: call.id, name: call.function.name, argsSummary: `重读拦截: ${pathArg}`, argsJson: callArgsJson,
+                    status: 'done',
+                    resultJson: JSON.stringify({ ok: true, cached: true, hint: `[缓存拦截] 文件「${pathArg}」自上次读取后未变更，内容见上文工具结果。如需修改请用 edit_file，需查看其他部分请用不同的 start_line/end_line。` }),
+                    resultSummary: `缓存拦截：${pathArg} 未变更`,
+                  }
+                  assistantMsg.toolRuns!.push(run)
+                  deps.session.save()
+                  deps.onChange()
+                  messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+                  continue
+                }
+              }
+            }
+          }
+          if (call.function.name === 'search_files') {
+            const query = String(JSON.parse(callArgsJson || '{}').pattern || JSON.parse(callArgsJson || '{}').query || '').trim().toLowerCase()
+            if (query) {
+              const count = (searchQueryCache.get(query) || 0) + 1
+              searchQueryCache.set(query, count)
+              if (count >= 3) {
+                const run: ToolRun = {
+                  id: call.id, name: call.function.name, argsSummary: `搜索螺旋拦截: ${query}`, argsJson: callArgsJson,
+                  status: 'error',
+                  resultJson: JSON.stringify({ ok: false, error: `[搜索螺旋拦截] 同一搜索词「${query}」已重复 ${count} 次，属于搜索死循环。请换不同关键词、或直接读取已知文件、或直接收尾交付。`, recovery: '换关键词 / 直接读文件 / 直接交付' }),
+                  resultSummary: '搜索螺旋拦截',
+                }
+                assistantMsg.toolRuns!.push(run)
+                deps.session.save()
+                deps.onChange()
+                messages.push({ role: 'tool', tool_call_id: call.id, content: run.resultJson })
+                continue
+              }
             }
           }
 
@@ -1169,6 +1406,16 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
             : String(toolResult.error || '').startsWith('用户拒绝') ? 'rejected' : 'error'
           run.resultJson = JSON.stringify(toolResult)
           run.resultSummary = summarizeResult(run.name, toolResult)
+
+          // ── 借鉴点 1（续）：记录执行结果，检测同一错误反复出现（OpenHands StuckDetector 模式 B）──
+          const failMsg = stuckDetector.recordResult(call.function.name, call.function.arguments || '{}', toolResult.ok === true, run.resultJson)
+          if (failMsg) {
+            // 同一错误反复：附加纠正指令到结果里，下轮让模型看到
+            const patched = JSON.parse(run.resultJson) as Record<string, unknown>
+            patched.recovery = failMsg
+            run.resultJson = JSON.stringify(patched)
+            run.resultSummary = `${run.resultSummary}（同错反复已纠正）`
+          }
           // 追踪修改与验证，供收尾前的验证闸门判断
           if (toolResult.ok) {
             if (tname === 'write_file' || tname === 'edit_file' || tname === 'delete_file' || tname === 'edit_notebook') {
