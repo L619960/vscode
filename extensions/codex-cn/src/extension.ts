@@ -174,6 +174,7 @@ function activate(context: vscode.ExtensionContext): void {
       type: 'state',
       messages: session.messages,
       running: cancelSource !== null,
+      paused: agentPaused,
       checkpoints: getCheckpoints().length,
       todos: board.items,
       sessions: manager.list(),
@@ -190,10 +191,16 @@ function activate(context: vscode.ExtensionContext): void {
   const stopAgent = (): void => {
     cancelSource?.cancel()
     cancelSource = null
+    agentPaused = false
     subAgents.stopAll()
     for (const [id, resolve] of pending) { resolve({ decision: 'deny', reason: '用户停止了任务' }); pending.delete(id) }
     postState({ running: false })
   }
+
+  // 暂停/继续：仅暂停 Agent 主循环，不取消 token（工具执行完当前步后停住）
+  let agentPaused = false
+  const pauseAgent = (): void => { agentPaused = true; postState({ paused: true }) }
+  const resumeAgent = (): void => { agentPaused = false; postState({ paused: false }) }
 
   const send = async (text: string): Promise<void> => {
     if (cancelSource) return
@@ -205,6 +212,7 @@ function activate(context: vscode.ExtensionContext): void {
       requestApproval,
       onChange: () => postState(),
       onPhase: (phase, detail) => postToWebview({ type: 'phase', phase, detail, mcpStatus: mcp.statusLine() }),
+      isPaused: () => agentPaused,
       toolDeps: { board, bgShell, browser },
       subAgents,
       taskBoard: board,
@@ -383,6 +391,8 @@ function activate(context: vscode.ExtensionContext): void {
         break
       case 'send': await send(String(msg.text || '')); break
       case 'stop': stopAgent(); break
+      case 'pause': pauseAgent(); break
+      case 'resume': resumeAgent(); break
       case 'clear':
         session.clear()
         clearCheckpoints()

@@ -23,6 +23,14 @@ interface Msg {
 /** 执行阶段：thinking（LLM 生成中）/ tool_call（执行工具）/ tool_result（回喂结果）/ responding（生成回复） */
 type AgentPhase = 'thinking' | 'tool_call' | 'tool_result' | 'responding' | null
 
+// ---- 工具分类（用于筛选）----
+type ToolCategory = 'all' | 'file' | 'cmd' | 'mcp' | 'agent'
+const TOOL_CATEGORY_MAP: Record<string, ToolCategory> = {
+  read_file: 'file', write_file: 'file', edit_file: 'file', delete_file: 'file', list_dir: 'file', search_files: 'file', glob: 'file', read_lints: 'file',
+  run_command: 'cmd', await_shell: 'cmd',
+  spawn_task: 'agent', await_task: 'agent',
+}
+
 // ---- Cursor 风格时间线：按用户消息把会话切成回合 ----
 interface ToolGroup {
   name: string
@@ -63,6 +71,7 @@ interface Segment {
 
 const messages = ref<Msg[]>([])
 const running = ref(false)
+const paused = ref(false)
 const input = ref('')
 // 可回滚的快照数量（>0 时显示回滚按钮）
 const checkpoints = ref(0)
@@ -73,6 +82,9 @@ const planClosed = ref(false)
 const currentPhase = ref<AgentPhase>(null)
 const phaseDetail = ref('')
 const mcpStatus = ref('')
+// 工具筛选
+const toolFilter = ref<ToolCategory>('all')
+const showToolFilter = ref(false)
 /** 规划完成度统计 */
 const planStats = computed(() => ({
   total: todos.value.length,
@@ -281,6 +293,7 @@ onMounted(() => {
     if (m.type === 'state') {
       messages.value = m.messages
       running.value = m.running
+      paused.value = m.paused ?? false
       checkpoints.value = m.checkpoints ?? 0
       todos.value = m.todos || []
       if (m.sessions) sessions.value = m.sessions
@@ -333,6 +346,8 @@ function send(): void {
   closeDropdown()
 }
 function stop(): void { vscodeApi.postMessage({ type: 'stop' }) }
+function pause(): void { vscodeApi.postMessage({ type: 'pause' }) }
+function resume(): void { vscodeApi.postMessage({ type: 'resume' }) }
 function clearHistory(): void {
   if (confirm('确定清空当前会话？')) vscodeApi.postMessage({ type: 'clear' })
 }
@@ -636,9 +651,12 @@ watch(running, (now, prev) => {
       </div>
     </div>
 
-    <!-- 阶段指示器 + MCP 状态灯 -->
+    <!-- 阶段指示器 + MCP 状态灯 + 暂停/继续 -->
     <div v-if="running" class="phase-bar">
       <span class="phase-indicator">{{ phaseLabel }}<template v-if="phaseDetail"> · {{ phaseDetail }}</template></span>
+      <button v-if="paused" class="mini phase-btn" @click="resume">▶ 继续</button>
+      <button v-else class="mini phase-btn" @click="pause">⏸ 暂停</button>
+      <button class="mini phase-btn stop" @click="stop">⏹ 终止</button>
       <span v-if="mcpStatus" class="mcp-status" title="MCP 工具服务器连接状态">{{ mcpStatus }}</span>
     </div>
 
