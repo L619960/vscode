@@ -1,7 +1,7 @@
 // 工具执行器：vscode workspace.fs / 原生 ripgrep 式搜索（自走目录）/
 // 写类走审批钩子 / run_command 用 child_process
 
-import { exec as cpExec } from 'node:child_process'
+import { exec as cpExec, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import { existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -627,13 +627,47 @@ async function execRunCommand(call: ToolCall, hooks: ExecHooks): Promise<Record<
   const cwdUri = cwdRel === '' ? rootUri() : toUri(cwdRel)
   const cwdPath = cwdUri.fsPath
 
+  /** 检测是否为持续运行命令（开发服务器、GUI 程序等） */
+  const isLongRunningCmd = (cmd: string): boolean => {
+    const lower = cmd.toLowerCase()
+    // npm/yarn/pnpm 的 dev/serve/start/watch 等开发服务器命令
+    if (/\b(npm|yarn|pnpm|bun)\s+(run\s+)?(dev|serve|start|watch|dev:server|preview)\b/.test(lower)) return true
+    // python/node 启动的服务器
+    if (/\b(python|node)\s+.*(server|app|main|index)\.(py|js|ts)\b/.test(lower) && /(http|express|flask|fastapi|django)/.test(lower)) return true
+    // vite/webpack/rollup/parcel 等构建工具的开发模式
+    if (/\b(vite|webpack|rollup|parcel|esbuild|turbo)\s+(dev|serve|watch)\b/.test(lower)) return true
+    // 直接启动 electron
+    if (/\belectron\s+\./.test(lower)) return true
+    return false
+  }
+
   /** 单次执行：chcp 65001 保证中文输出编码；强制 Python 以 UTF-8 输出 */
   const runOnce = async (rawCmd: string): Promise<Record<string, any>> => {
     // 剥反引号：cmd.exe 里反引号不是特殊字符，模型常把 PowerShell 的 `URL` 语法
     // 带进来导致环境变量值被反引号污染（如 ELECTRON_MIRROR=`https://...`），镜像失效
     const cmd = rawCmd.replace(/`/g, '')
+    // 持续运行命令：用 spawn 后台启动，不等待结束，返回启动成功
+    if (isLongRunningCmd(cmd)) {
+      return new Promise((resolve) => {
+        const child = spawn(cmd, {
+          cwd: cwdPath,
+          shell: true,
+          windowsHide: true,
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+        })
+        let stdout = ''
+        let stderr = ''
+        let started = false
+        child.stdout?.on('data', (d: Buffer) => { stdout += d.toString(); if (!started && stdout.length > 10) { started = true; resolve({ ok: true, code: 0, stdout: `已后台启动：${cmd}\n${stdout.slice(0, 500)}`, stderr, note: '持续运行进程已后台启动，使用 await_shell 查看输出' }) } })
+        child.stderr?.on('data', (d: Buffer) => { stderr += d.toString() })
+        child.on('error', (e) => { if (!started) resolve({ ok: false, error: e.message }) })
+        child.on('exit', (code) => { if (!started) resolve({ ok: code === 0, code, stdout, stderr }) })
+        // 启动后 3 秒无输出也认为已启动（有些服务器启动慢）
+        setTimeout(() => { if (!started) { started = true; resolve({ ok: true, code: 0, stdout: `已后台启动：${cmd}`, stderr, note: '持续运行进程已后台启动，使用 await_shell 查看输出' }) } }, 3000)
+      })
+    }
+    // 一次性命令：用 exec 等待完成
     try {
-      // 用户要求不限制命令执行时长，移除 timeout 参数
       const { stdout: rawOut, stderr: rawErr } = await execPromise(`chcp 65001 >nul && ${cmd}`, {
         cwd: cwdPath, maxBuffer: 10 * 1024 * 1024, windowsHide: true,
         // 清除 ELECTRON_RUN_AS_NODE：扩展宿主进程自身设了此变量，会污染子进程
