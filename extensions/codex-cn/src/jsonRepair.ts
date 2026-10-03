@@ -156,11 +156,15 @@ export function parseXmlToolCalls(text: string): XmlToolCall[] {
     // 解析 name
     const nameMatch = attrs.match(/name\s*=\s*"([^"]*)"/)
     const name = nameMatch ? nameMatch[1] : ''
-    // 解析 args：优先单引号包裹的 JSON，其次双引号
+    // 解析 args：优先单引号包裹的 JSON，其次双引号（双引号需处理转义引号 \"）
     let args: Record<string, unknown> = {}
     const argsSingle = attrs.match(/args\s*=\s*'([^']*)'/)
-    const argsDouble = attrs.match(/args\s*=\s*"([^"]*)"/)
-    const argsStr = argsSingle ? argsSingle[1] : argsDouble ? argsDouble[1] : ''
+    const argsDouble = attrs.match(/args\s*=\s*"((?:\\.|[^"\\])*)"/)
+    let argsStr = argsSingle ? argsSingle[1] : argsDouble ? argsDouble[1] : ''
+    // 双引号模式：把 \" 还原为 "，\\ 还原为 \
+    if (argsDouble && !argsSingle) {
+      argsStr = argsStr.replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+    }
     if (argsStr) {
       try {
         args = JSON.parse(argsStr)
