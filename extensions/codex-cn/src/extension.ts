@@ -83,8 +83,43 @@ function activate(context: vscode.ExtensionContext): void {
   const browser = new BrowserSession()
 
   // MCP 客户端：连接 codex-cn.mcpServers 配置的外部工具服务器（失败跳过不阻断启动）
+  // 内置默认接入高价值 MCP 服务器，与用户自定义配置合并
   const mcp = new McpManager()
-  const mcpServers = vscode.workspace.getConfiguration('codex-cn').get<Record<string, McpServerConfig>>('mcpServers', {})
+  const userMcpServers = vscode.workspace.getConfiguration('codex-cn').get<Record<string, McpServerConfig>>('mcpServers', {})
+  const defaultMcpServers: Record<string, McpServerConfig> = {
+    'sequential-thinking': {
+      type: 'stdio',
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-sequential-thinking'],
+    },
+    'playwright': {
+      type: 'stdio',
+      command: 'npx',
+      args: ['-y', '@playwright/mcp@latest', '--headless'],
+    },
+    'chrome-devtools': {
+      type: 'stdio',
+      command: 'npx',
+      args: ['-y', 'chrome-devtools-mcp@latest', '--headless', '--no-usage-statistics'],
+    },
+    'context7': {
+      type: 'stdio',
+      command: 'npx',
+      args: ['-y', '@upstash/context7-mcp'],
+    },
+    'filesystem': {
+      type: 'stdio',
+      command: 'npx',
+      args: ['-y', '@modelcontextprotocol/server-filesystem', '.'],
+    },
+    'github': {
+      type: 'stdio',
+      command: 'npx',
+      args: ['-y', '@github/mcp-server'],
+      env: { GITHUB_PERSONAL_ACCESS_TOKEN: '' },
+    },
+  }
+  const mcpServers: Record<string, McpServerConfig> = { ...defaultMcpServers, ...userMcpServers }
   if (Object.keys(mcpServers).length > 0) {
     void mcp.connectAll(mcpServers).then(errors => {
       if (errors.length > 0) {
