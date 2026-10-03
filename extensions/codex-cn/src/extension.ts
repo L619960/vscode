@@ -115,7 +115,7 @@ function activate(context: vscode.ExtensionContext): void {
     'github': {
       type: 'stdio',
       command: 'npx',
-      args: ['-y', '@github/mcp-server'],
+      args: ['-y', '@modelcontextprotocol/server-github'],
       env: { GITHUB_PERSONAL_ACCESS_TOKEN: '' },
     },
   }
