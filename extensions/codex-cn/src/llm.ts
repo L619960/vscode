@@ -105,8 +105,8 @@ export async function chatCompletion(opts: {
       model: config.model,
       messages: msgs,
       stream: true,
-      // 8192 上限：既够单文件代码生成（约 6KB），又限制小模型无限发散思考链（过度思考）
-      max_tokens: 8192,
+      // 16384 上限：支持大文件生成（如完整 Vue 组件/长代码），避免 write_file 参数截断
+      max_tokens: 16384,
       ...(withTools && tools?.length ? { tools, tool_choice: 'auto' } : {}),
     })
 

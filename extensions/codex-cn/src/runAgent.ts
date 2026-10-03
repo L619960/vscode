@@ -83,10 +83,11 @@ function detectLoop(text: string): boolean {
 /** 截断恢复指令：引导模型用更紧凑的写法或分批 edit */
 const TRUNCATION_RECOVERY = [
   '上一次工具调用因参数内容过长，在生成中途被截断（JSON 不完整，服务端无法解析）。',
-  '注意：重复同样的一次性写法必然再次失败，必须改为更紧凑的写法或分批写入：',
-  '1. 精简代码，去掉冗余注释与空行，用更紧凑的风格重写；',
-  '2. 或先 write_file 写入核心结构，再用 edit_file 分批补充细节；',
-  '现在只输出精简后的 write_file 调用。',
+  '必须改为分批写入：',
+  '1. 把文件内容拆成多个 write_file 调用，每个调用不超过 100 行代码；',
+  '2. 第一个 write_file 写入文件头（imports + 核心结构），后续 write_file 追加剩余部分；',
+  '3. 或使用 edit_file 的 append 模式分批追加；',
+  '现在只输出第一个分批的 write_file 调用。',
 ].join('\n')
 
 /** write_file 单次行数上限（仅防 JSON 截断，不阻止执行） */
