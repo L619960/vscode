@@ -664,15 +664,8 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         }
       }
 
-      messages.push({
-        role: 'assistant',
-        content: result.content || null,
-        ...(result.toolCalls.length
-          ? { tool_calls: result.toolCalls }
-          : {}),
-      })
-
       // ★ 降级模式：服务端 tool_calls 解析失败时，模型在 content 里用 <tool_call> XML 或 JSON 输出
+      // 必须在 push assistant 之前解析，确保 assistant 消息携带 tool_calls
       if (result.toolCalls.length === 0 && result.content) {
         const xmlCalls = parseXmlToolCalls(result.content)
         const jsonCalls = xmlCalls.length === 0 ? parseJsonToolCalls(result.content) : []
@@ -690,6 +683,14 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
             .trim()
         }
       }
+
+      messages.push({
+        role: 'assistant',
+        content: result.content || null,
+        ...(result.toolCalls.length
+          ? { tool_calls: result.toolCalls }
+          : {}),
+      })
 
       if (result.toolCalls.length === 0) {
         const isEmpty = !(result.content || '').trim()
