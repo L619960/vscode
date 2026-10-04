@@ -694,8 +694,10 @@ class ChatViewProvider implements vscode.WebviewViewProvider {
 type WebviewView = 'chat' | 'agent' | 'settings'
 
 function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri, view: WebviewView): string {
-  const script = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'webview.js'))
-  const styles = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'webview.css'))
+  // 版本参数：每次扩展激活生成新值，强制浏览器加载最新 webview 资源（防止同路径旧 JS 被缓存复用）
+  const v = Date.now()
+  const script = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'webview.js')).with({ query: `v=${v}` })
+  const styles = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'webview.css')).with({ query: `v=${v}` })
   const nonce = getNonce()
   return `<!DOCTYPE html>
 <html lang="zh-CN">
