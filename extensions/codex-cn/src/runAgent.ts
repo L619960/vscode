@@ -362,10 +362,9 @@ async function semanticCompress(messages: ChatMessage[], deps: AgentDeps, force:
   const system = messages[0]?.role === 'system' ? messages[0] : undefined
   const body = system ? messages.slice(1) : messages.slice()
 
+  // 触发（任一）：手动 force / 字符超阈值 / 未摘要消息达 12 条（planFoldRange 内判断）
   const total = body.reduce((n, m) => n + msgLen(m), 0)
-  if (!force && total <= COMPRESS_THRESHOLD) return messages
-
-  const range = planFoldRange(deps.session, force)
+  const range = planFoldRange(deps.session, force || total > COMPRESS_THRESHOLD)
   if (!range) return messages
 
   // 建立 session 索引 → body 索引映射；同时提取已有累积摘要及其位置
