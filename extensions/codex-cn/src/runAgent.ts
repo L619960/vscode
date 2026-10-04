@@ -257,6 +257,8 @@ export interface AgentDeps {
   onPhase?: (phase: string, detail?: string) => void
   /** 暂停检查：返回 true 时本轮跳过（进入自旋等待） */
   isPaused?: () => boolean
+  /** 单步模式闸门：每轮开始前等待用户放行；关闭单步模式时应立即放行 */
+  stepGate?: () => Promise<void>
 }
 
 /** 2 层目录摘要 */
@@ -628,6 +630,19 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
     for (let round = 1; ; round++) {
       if (token.isCancellationRequested || abort.signal.aborted) return
       if (deps.isPaused?.()) { await new Promise(r => setTimeout(r, 500)); continue }
+      // 单步模式：每轮开始前等待用户点击「下一步」；任务取消时立即退出等待
+      if (deps.stepGate) {
+        await Promise.race([
+          deps.stepGate(),
+          new Promise<void>((resolve) => {
+            let d: { dispose(): void } | undefined
+            const l = () => { d?.dispose(); abort.signal.removeEventListener('abort', l); resolve() }
+            d = token.onCancellationRequested(l)
+            abort.signal.addEventListener('abort', l)
+          }),
+        ])
+        if (token.isCancellationRequested || abort.signal.aborted) return
+      }
 
       // 每轮开始前压缩一次历史，防止长任务中上下文无限膨胀
       messages = compressHistory(messages)

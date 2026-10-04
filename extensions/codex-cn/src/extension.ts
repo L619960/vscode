@@ -187,20 +187,50 @@ function activate(context: vscode.ExtensionContext): void {
   const subAgents = new SubAgentManager(() => getApiKey(context.secrets), { board, bgShell, browser })
   context.subscriptions.push({ dispose: () => { subAgents.stopAll() } })
 
-  // 停止当前 Agent 任务：取消 token + 按拒绝释放全部待审批 + 停掉全部子 Agent
+  // 暂停/继续：仅暂停 Agent 主循环，不取消 token（工具执行完当前步后停住）
+  let agentPaused = false
+  // 单步模式：每轮开始前停在闸门处，等用户放行一次
+  let stepMode = vscode.workspace.getConfiguration('codex-cn').get<boolean>('stepMode', false)
+  let pendingStep: { resolve: () => void; reject: (e: Error) => void } | null = null
+  const stepGate = (): Promise<void> => new Promise((resolve, reject) => {
+    if (!stepMode) { resolve(); return }
+    pendingStep = { resolve, reject }
+    postState({ paused: true, stepping: true })
+  })
+
+  // 停止当前 Agent 任务：取消 token + 释放单步闸门 + 停掉全部子 Agent
   const stopAgent = (): void => {
     cancelSource?.cancel()
     cancelSource = null
     agentPaused = false
+    if (pendingStep) { pendingStep.resolve(); pendingStep = null }
     subAgents.stopAll()
     for (const [id, resolve] of pending) { resolve({ decision: 'deny', reason: '用户停止了任务' }); pending.delete(id) }
-    postState({ running: false })
+    postState({ running: false, paused: false, stepping: false })
   }
 
-  // 暂停/继续：仅暂停 Agent 主循环，不取消 token（工具执行完当前步后停住）
-  let agentPaused = false
-  const pauseAgent = (): void => { agentPaused = true; postState({ paused: true }) }
-  const resumeAgent = (): void => { agentPaused = false; postState({ paused: false }) }
+  const pauseAgent = (): void => { agentPaused = true; postState({ paused: true, stepping: false }) }
+  /** 继续：手动暂停时恢复循环；单步停等时放行一轮（下轮结束会再次停等） */
+  const resumeAgent = (): void => {
+    if (pendingStep) {
+      const p = pendingStep; pendingStep = null
+      p.resolve()
+      postState({ paused: false, stepping: false })
+    } else {
+      agentPaused = false
+      postState({ paused: false, stepping: false })
+    }
+  }
+  // 单步模式开关实时生效：运行中关闭则立即放行当前闸门
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((e) => {
+    if (!e.affectsConfiguration('codex-cn.stepMode')) return
+    stepMode = vscode.workspace.getConfiguration('codex-cn').get<boolean>('stepMode', false)
+    if (!stepMode && pendingStep) {
+      const p = pendingStep; pendingStep = null
+      p.resolve()
+      postState({ paused: false, stepping: false })
+    }
+  }))
 
   const send = async (text: string): Promise<void> => {
     if (cancelSource) return
@@ -213,6 +243,7 @@ function activate(context: vscode.ExtensionContext): void {
       onChange: () => postState(),
       onPhase: (phase, detail) => postToWebview({ type: 'phase', phase, detail, mcpStatus: mcp.statusLine() }),
       isPaused: () => agentPaused,
+      stepGate,
       toolDeps: { board, bgShell, browser },
       subAgents,
       taskBoard: board,
@@ -225,7 +256,7 @@ function activate(context: vscode.ExtensionContext): void {
     }
     await runAgent(text, deps, cancelSource.token)
     cancelSource = null
-    postState({ running: false })
+    postState({ running: false, paused: false, stepping: false })
   }
 
   // 新建会话：先停止正在运行的任务，再创建并跳转（当前为空会话时不重复创建）
@@ -284,7 +315,7 @@ function activate(context: vscode.ExtensionContext): void {
     const s = getAgentSettings()
     return {
       provider: c.get('provider'), baseUrl: c.get('baseUrl'), model: c.get('model'),
-      supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), planMode: c.get('planMode'), superpowers: c.get('superpowers'), tabCompletion: c.get('tabCompletion'), hasKey: !!key,
+      supportsTools: c.get('supportsTools'), autoApprove: c.get('autoApprove'), planMode: c.get('planMode'), stepMode: c.get('stepMode'), superpowers: c.get('superpowers'), tabCompletion: c.get('tabCompletion'), hasKey: !!key,
       // 工具开关 / 隐私 / 对话流
       toolRead: s.toolRead, toolWrite: s.toolWrite, toolShell: s.toolShell,
       toolBrowser: s.toolBrowser, toolWeb: s.toolWeb, privacyMode: s.privacyMode,
@@ -296,7 +327,7 @@ function activate(context: vscode.ExtensionContext): void {
 
   type ConfigPatch = {
     provider?: string; baseUrl?: string; model?: string; supportsTools?: string
-    autoApprove?: boolean; planMode?: boolean; superpowers?: boolean; tabCompletion?: boolean; apiKey?: string
+    autoApprove?: boolean; planMode?: boolean; stepMode?: boolean; superpowers?: boolean; tabCompletion?: boolean; apiKey?: string
     toolRead?: boolean; toolWrite?: boolean; toolShell?: boolean; toolBrowser?: boolean; toolWeb?: boolean
     privacyMode?: boolean; maxMessages?: number; autoTitle?: boolean; maxSessions?: number
   }

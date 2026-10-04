@@ -11,6 +11,7 @@ interface ToolRun {
   status: 'running' | 'awaiting' | 'done' | 'error' | 'rejected'
   resultSummary: string
   resultJson?: string   // 结构化结果（diff 行数统计等）
+  argsJson?: string     // 原始工具参数（文件引用追踪等）
 }
 interface Msg {
   role: 'user' | 'assistant'
@@ -72,6 +73,7 @@ interface Segment {
 const messages = ref<Msg[]>([])
 const running = ref(false)
 const paused = ref(false)
+const stepping = ref(false)
 const input = ref('')
 // 可回滚的快照数量（>0 时显示回滚按钮）
 const checkpoints = ref(0)
@@ -277,6 +279,7 @@ const showWaiting = computed<boolean>(() => {
 
 /** 阶段指示器文案 */
 const phaseLabel = computed(() => {
+  if (paused.value) return stepping.value ? '🐾 单步等待' : '⏸ 已暂停'
   if (!currentPhase.value) return ''
   const map: Record<string, string> = {
     thinking: '💭 思考中',
@@ -287,6 +290,30 @@ const phaseLabel = computed(() => {
   return map[currentPhase.value] || currentPhase.value
 })
 
+// ---- 文件引用追踪：从会话内 read/write/edit/delete 调用中提取去重 ----
+interface FileRef { path: string; read: boolean; written: boolean }
+const WRITE_TOOLS = new Set(['write_file', 'edit_file', 'delete_file'])
+const fileRefs = computed<FileRef[]>(() => {
+  const map = new Map<string, FileRef>()
+  for (const msg of messages.value) {
+    for (const t of msg.toolRuns ?? []) {
+      if (t.name !== 'read_file' && !WRITE_TOOLS.has(t.name)) continue
+      let p = ''
+      try { p = String(JSON.parse(t.argsJson || '{}').path ?? '') } catch { continue }
+      if (!p) continue
+      const ref = map.get(p) ?? { path: p, read: false, written: false }
+      if (t.name === 'read_file') ref.read = true
+      if (WRITE_TOOLS.has(t.name)) ref.written = true
+      map.set(p, ref)
+    }
+  }
+  // 已修改的排前面，其次按路径排序
+  return [...map.values()].sort((a, b) => Number(b.written) - Number(a.written) || a.path.localeCompare(b.path))
+})
+const fileRefsClosed = ref(false)
+/** 只显示文件名，去掉目录前缀（hover 可见完整路径） */
+function baseName(p: string): string { return p.split(/[\\/]/).pop() ?? p }
+
 onMounted(() => {
   window.addEventListener('message', (e: MessageEvent) => {
     const m = e.data
@@ -294,6 +321,7 @@ onMounted(() => {
       messages.value = m.messages
       running.value = m.running
       paused.value = m.paused ?? false
+      stepping.value = m.stepping ?? false
       checkpoints.value = m.checkpoints ?? 0
       todos.value = m.todos || []
       if (m.sessions) sessions.value = m.sessions
@@ -654,7 +682,7 @@ watch(running, (now, prev) => {
     <!-- 阶段指示器 + MCP 状态灯 + 暂停/继续 -->
     <div v-if="running" class="phase-bar">
       <span class="phase-indicator">{{ phaseLabel }}<template v-if="phaseDetail"> · {{ phaseDetail }}</template></span>
-      <button v-if="paused" class="mini phase-btn" @click="resume">▶ 继续</button>
+      <button v-if="paused" class="mini phase-btn" @click="resume">{{ stepping ? '▶ 下一步' : '▶ 继续' }}</button>
       <button v-else class="mini phase-btn" @click="pause">⏸ 暂停</button>
       <button class="mini phase-btn stop" @click="stop">⏹ 终止</button>
       <span v-if="mcpStatus" class="mcp-status" title="MCP 工具服务器连接状态">{{ mcpStatus }}</span>
@@ -678,6 +706,22 @@ watch(running, (now, prev) => {
               <div v-if="item.remark" class="task-remark">备注：{{ item.remark }}</div>
             </div>
           </div>
+        </div>
+      </div>
+      <!-- 本次会话涉及的文件：已修改排前，点击在编辑器中打开 -->
+      <div v-if="fileRefs.length" class="fileref-card">
+        <div class="plan-head" @click="fileRefsClosed = !fileRefsClosed">
+          <span class="plan-title">📁 本次涉及文件</span>
+          <span class="plan-progress">{{ fileRefs.filter(f => f.written).length }} 修改 / {{ fileRefs.length }} 总计</span>
+          <span class="plan-arrow">{{ fileRefsClosed ? '▸' : '▾' }}</span>
+        </div>
+        <div class="fileref-list" v-show="!fileRefsClosed">
+          <a v-for="f in fileRefs" :key="f.path" class="fileref-item" :class="{ written: f.written }"
+            :title="f.path" @click.prevent="openFile(f.path)">
+            <span class="fileref-icon">{{ f.written ? '✏️' : '📄' }}</span>
+            <span class="fileref-name">{{ baseName(f.path) }}</span>
+            <span v-if="f.written && f.read" class="fileref-tag">读+写</span>
+          </a>
         </div>
       </div>
       <div v-if="messages.length === 0" class="empty">

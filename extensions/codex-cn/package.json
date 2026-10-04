@@ -152,6 +152,11 @@
           "default": false,
           "description": "计划确认模式：AI 执行写文件/命令前必须先提交实施方案并获你批准（对标 Trae Plan 模式）"
         },
+        "codex-cn.stepMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "单步模式：每一轮 Agent 决策前暂停，等你点击「下一步」后执行。适合调试弱模型决策过程，可随时关闭立即恢复"
+        },
         "codex-cn.superpowers": {
           "type": "boolean",
           "default": false,

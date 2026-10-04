@@ -491,6 +491,14 @@ function asNumber(e: Event): number { return Number((e.target as HTMLInputElemen
             <input type="checkbox" class="tg" :checked="cfg.tabCompletion !== false"
               @change="patch({ tabCompletion: asChecked($event) })" />
           </div>
+          <div class="row">
+            <div class="row-txt">
+              <div class="row-name">🐾 单步模式</div>
+              <div class="row-desc">每轮决策前暂停，点「下一步」执行；运行中也可随时开关</div>
+            </div>
+            <input type="checkbox" class="tg" :checked="!!cfg.stepMode"
+              @change="patch({ stepMode: asChecked($event) })" />
+          </div>
         </div>
       </section>
 
