@@ -2,7 +2,7 @@
 
 import * as vscode from 'vscode'
 import { Session, SessionManager } from './session.js'
-import { runAgent, type AgentDeps } from './runAgent.js'
+import { runAgent, planFoldRange, buildSessionTranscript, buildMechanicalSummary, type AgentDeps } from './runAgent.js'
 import { getApiKey, saveApiKey, getProvider, applyProviderPreset, setConfig, getLLMConfig, getAgentSettings, PROVIDER_PRESETS } from './config.js'
 import { chatCompletion } from './llm.js'
 import { registerTabCompletion } from './tabCompletion.js'
@@ -42,6 +42,19 @@ const PROMPT_OPTIMIZER_SYSTEM = `你是「提示词优化」助手。用户会�
 2. 补全隐含的目标、约束与验收标准，但不虚构用户未提出的需求。
 3. 结构清晰，可适当分点；篇幅不要明显超过原文。
 4. 只输出优化后的提示词本身，不要任何解释、前缀或引号。`
+
+/** 历史摘要的系统指令：把早期对话压缩成结构化中文摘要 */
+const SUMMARIZER_SYSTEM = `你是「对话历史摘要」助手。请把用户与编程 AI Agent 的一段早期对话压缩成结构化中文摘要，供后续对话延续使用。
+要求：
+1. 用简体中文，总篇幅不超过 500 字（内容多时优先保留与任务推进直接相关的信息）。
+2. 按以下结构输出：
+   - 任务目标：用户的核心诉求与验收标准
+   - 已完成：关键进展、已创建/修改的文件及内容要点
+   - 关键决策：采用的方案、重要约定（含用户明确要求）
+   - 待处理：未完成事项、已知错误或风险
+3. 只保留事实，丢弃寒暄、重复探索与失败的无效尝试；没有的小节可省略。
+4. 若给出「上一版摘要」，请在其基础上增量合并，不得丢失其中仍有效的信息。
+5. 只输出摘要本身，不要解释、前缀或引号。`
 
 function activate(context: vscode.ExtensionContext): void {
   manager = new SessionManager(
@@ -177,6 +190,8 @@ function activate(context: vscode.ExtensionContext): void {
       paused: agentPaused,
       checkpoints: getCheckpoints().length,
       todos: board.items,
+      summaries: session.summaries,
+      maxMessages: getAgentSettings().maxMessages,
       sessions: manager.list(),
       activeId: manager.activeId,
       ...extra,
@@ -232,6 +247,60 @@ function activate(context: vscode.ExtensionContext): void {
     }
   }))
 
+  // ── P3：历史语义摘要 + 上下文压缩 ──
+  let compressRequested = false
+  const consumeCompressRequest = (): boolean => {
+    if (!compressRequested) return false
+    compressRequested = false
+    return true
+  }
+
+  /** 调用模型生成历史摘要（独立小请求，token 上限 1200） */
+  const summarize = async (transcript: string, priorSummary: string | null): Promise<string> => {
+    const config = getLLMConfig(await getApiKey(context.secrets))
+    const userContent = (priorSummary ? `【上一版摘要】\n${priorSummary}\n\n` : '') + `【待摘要对话】\n${transcript}`
+    const result = await chatCompletion({
+      messages: [
+        { role: 'system', content: SUMMARIZER_SYSTEM },
+        { role: 'user', content: userContent },
+      ],
+      config, signal: AbortSignal.timeout(90000), maxTokens: 1200,
+    })
+    if (!result.content?.trim()) throw new Error('摘要模型返回空内容')
+    return result.content
+  }
+
+  /** 构造摘要记录写入会话 */
+  const commitRangeSummary = (range: { fromIndex: number; toIndex: number }, text: string): void => {
+    const sm = session.messages
+    session.addSummary({
+      id: `sum_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      fromIndex: range.fromIndex, toIndex: range.toIndex,
+      fromTs: sm[range.fromIndex].ts ?? 0, toTs: sm[range.toIndex].ts ?? 0,
+      text: text.trim(), messageCount: range.toIndex - range.fromIndex + 1, createdAt: Date.now(),
+    })
+  }
+
+  /** 空闲时立即压缩：生成摘要 → 落盘 → 广播；失败回退机械摘要 */
+  const compressSessionNow = async (): Promise<void> => {
+    const range = planFoldRange(session, true)
+    if (!range) {
+      void vscode.window.showInformationMessage('暂无可压缩的历史：最近的对话内容需要保留')
+      return
+    }
+    const transcript = buildSessionTranscript(session, range.fromIndex, range.toIndex)
+    const prior = session.summaries.length ? session.summaries[session.summaries.length - 1].text : null
+    let text: string
+    try {
+      text = await summarize(transcript, prior)
+    } catch (e) {
+      text = buildMechanicalSummary(session, range.fromIndex, range.toIndex)
+      void vscode.window.showWarningMessage(`语义摘要失败，已使用机械摘要：${(e as Error).message}`)
+    }
+    commitRangeSummary(range, text)
+    postState()
+  }
+
   const send = async (text: string): Promise<void> => {
     if (cancelSource) return
     cancelSource = new vscode.CancellationTokenSource()
@@ -244,6 +313,8 @@ function activate(context: vscode.ExtensionContext): void {
       onPhase: (phase, detail) => postToWebview({ type: 'phase', phase, detail, mcpStatus: mcp.statusLine() }),
       isPaused: () => agentPaused,
       stepGate,
+      summarize,
+      consumeCompressRequest,
       toolDeps: { board, bgShell, browser },
       subAgents,
       taskBoard: board,
@@ -417,6 +488,8 @@ function activate(context: vscode.ExtensionContext): void {
         void webview.postMessage({
           type: 'state', messages: session.messages,
           running: cancelSource !== null, checkpoints: getCheckpoints().length,
+          paused: agentPaused, summaries: session.summaries,
+          maxMessages: getAgentSettings().maxMessages,
           todos: board.items, sessions: manager.list(), activeId: manager.activeId,
         })
         break
@@ -424,6 +497,11 @@ function activate(context: vscode.ExtensionContext): void {
       case 'stop': stopAgent(); break
       case 'pause': pauseAgent(); break
       case 'resume': resumeAgent(); break
+      case 'compressNow':
+        // 运行中只登记请求（agent 下轮开始时执行，保证消息映射一致）；空闲时立即压缩
+        if (cancelSource) compressRequested = true
+        else await compressSessionNow()
+        break
       case 'clear':
         session.clear()
         clearCheckpoints()

@@ -259,6 +259,10 @@ export interface AgentDeps {
   isPaused?: () => boolean
   /** 单步模式闸门：每轮开始前等待用户放行；关闭单步模式时应立即放行 */
   stepGate?: () => Promise<void>
+  /** 历史摘要生成（独立 LLM 小请求）：返回摘要正文；失败抛错由调用方回退机械摘要 */
+  summarize?: (transcript: string, priorSummary: string | null) => Promise<string>
+  /** 消费一次「立即压缩」请求（用户手动触发），返回是否有待处理请求 */
+  consumeCompressRequest?: () => boolean
 }
 
 /** 2 层目录摘要 */
@@ -281,56 +285,142 @@ async function buildDirSummary(): Promise<string> {
 
 /** 历史压缩阈值（字符数）：超过则把早期消息折叠为摘要，而不是硬截断 */
 const COMPRESS_THRESHOLD = 100000
-/** 压缩时保留最近的消息条数（约 8 组 user/assistant 交互） */
-const KEEP_RECENT_MESSAGES = 16
+
+/** 摘要消息在 LLM messages 中的标记前缀（仅用于识别/替换，UI 不显示标记） */
+const SUMMARY_MARKER = '[历史摘要]\n'
+/** 自动折叠触发：未摘要的早期消息达到此条数（session 消息单位，约 6 个 assistant 步骤） */
+const SUMMARY_TRIGGER_MESSAGES = 12
+/** 压缩时保留最近的 session 消息条数 */
+const KEEP_RECENT_SESSION = 8
+/** 摘要请求时单条消息/整段 transcript 的上限（防摘要请求自身撑爆上下文） */
+const SUMMARY_TRANSCRIPT_LIMIT = 60000
 
 function msgLen(m: ChatMessage): number {
   return (typeof m.content === 'string' ? m.content.length : 0)
     + (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0)
 }
 
+export interface FoldRange { fromIndex: number; toIndex: number }
+
 /**
- * 历史压缩：总长度未超阈值时原样返回；否则保留 system prompt + 最近 8 条，
- * 更早的消息折叠成一条摘要（含关键工具操作记录），避免上下文无限膨胀
+ * 计算可折叠区间：从最后一条摘要之后开始，保留最近 8 条消息；
+ * 折叠段必须结束在 assistant 消息（其 tool_calls/tool 配对完整，不会切散协议）。
+ * force（手动触发/字符超阈）时允许折叠更少；无候选返回 null。
  */
-function compressHistory(messages: ChatMessage[]): ChatMessage[] {
-  const total = messages.reduce((n, m) => n + msgLen(m), 0)
-  if (total <= COMPRESS_THRESHOLD) return messages
+export function planFoldRange(session: Session, force = false): FoldRange | null {
+  const startAfter = session.summaries.length ? session.summaries[session.summaries.length - 1].toIndex : -1
+  const first = startAfter + 1
+  let to = session.messages.length - KEEP_RECENT_SESSION - 1
+  if (to < first) return null
+  while (to >= first && session.messages[to].role !== 'assistant') to--
+  if (to < first) return null
+  if (!force && to - first + 1 < SUMMARY_TRIGGER_MESSAGES) return null
+  return { fromIndex: first, toIndex: to }
+}
 
-  const system = messages[0]?.role === 'system' ? messages[0] : undefined
-  const rest = system ? messages.slice(1) : messages.slice()
-  if (rest.length <= KEEP_RECENT_MESSAGES) return messages
-
-  const old = rest.slice(0, -KEEP_RECENT_MESSAGES)
-  const recent = rest.slice(-KEEP_RECENT_MESSAGES)
-  // 丢掉 recent 开头的孤儿 tool 消息（对应 assistant 调用已被折叠），避免协议错乱
-  while (recent.length && recent[0].role === 'tool') recent.shift()
-  // 丢掉 recent 末尾配对不全的 assistant(tool_calls)（其 tool 消息被切到 old 折叠），
-  // 否则 llama/OpenAI 校验报 "insufficient tool messages following tool_calls message"
-  while (recent.length && recent[recent.length - 1].role === 'assistant' && recent[recent.length - 1].tool_calls?.length) {
-    old.push(recent.pop()!)
-  }
-
-  // 从早期消息中提取关键决策（工具调用记录）
-  const decisions: string[] = []
-  for (const m of old) {
-    if (m.role !== 'assistant' || !m.tool_calls) continue
-    for (const tc of m.tool_calls) {
-      try {
-        const args = JSON.parse(tc.function.arguments || '{}') as Record<string, unknown>
-        const target = String(args.path || args.command || args.query || '').slice(0, 80)
-        decisions.push(target ? `${tc.function.name} ${target}` : tc.function.name)
-      } catch { decisions.push(tc.function.name) }
+/** 把 session 的一段消息转成给摘要模型的纯文本（用户意图 + AI 回复 + 工具操作/结果） */
+export function buildSessionTranscript(session: Session, from: number, to: number): string {
+  const lines: string[] = []
+  for (let i = from; i <= to; i++) {
+    const m = session.messages[i]
+    if (m.role === 'user') {
+      lines.push(`### 用户\n${m.content.slice(0, 4000)}`)
+      continue
+    }
+    if (m.content) lines.push(`### AI 回复\n${m.content.slice(0, 4000)}`)
+    for (const t of m.toolRuns || []) {
+      lines.push(`[工具 ${t.name}] ${t.argsSummary}` + (t.resultSummary ? ` => ${t.resultSummary}` : ''))
     }
   }
-  const summaryMsg: ChatMessage = {
-    role: 'user',
-    content: `[...earlier conversation summarized...] 早期 ${old.length} 条消息已折叠。`
-      + (decisions.length
-        ? `\n关键操作记录：\n${decisions.slice(0, 20).map((d) => `- ${d}`).join('\n')}`
-        : ''),
+  return lines.join('\n').slice(0, SUMMARY_TRANSCRIPT_LIMIT)
+}
+
+/** 机械摘要（LLM 不可用/失败时兜底）：提取工具操作链与最后阶段结论 */
+export function buildMechanicalSummary(session: Session, from: number, to: number): string {
+  const decisions: string[] = []
+  let lastReply = ''
+  for (let i = from; i <= to; i++) {
+    const m = session.messages[i]
+    if (m.role !== 'assistant') continue
+    for (const t of m.toolRuns || []) {
+      decisions.push(`${t.name} ${t.argsSummary}${t.resultSummary ? ' → ' + t.resultSummary : ''}`)
+    }
+    if (m.content) lastReply = m.content
   }
-  return system ? [system, summaryMsg, ...recent] : [summaryMsg, ...recent]
+  const parts = [`已折叠 ${to - from + 1} 条早期消息。`]
+  if (decisions.length) parts.push(`关键操作：\n${decisions.slice(-20).map((d) => `- ${d}`).join('\n')}`)
+  if (lastReply) parts.push(`阶段结论：${lastReply.slice(0, 1000)}`)
+  return parts.join('\n')
+}
+
+/**
+ * 语义历史压缩（P3）：达触发条件时把早期消息折叠为一条累积摘要——
+ * 摘要正文优先由 LLM 生成（带上已有摘要做增量总结），失败回退机械摘要；
+ * session.summaries 逐次留档（UI 折叠卡），LLM messages 中摘要始终合并为一条。
+ */
+async function semanticCompress(messages: ChatMessage[], deps: AgentDeps, force: boolean): Promise<ChatMessage[]> {
+  const system = messages[0]?.role === 'system' ? messages[0] : undefined
+  const body = system ? messages.slice(1) : messages.slice()
+
+  const total = body.reduce((n, m) => n + msgLen(m), 0)
+  if (!force && total <= COMPRESS_THRESHOLD) return messages
+
+  const range = planFoldRange(deps.session, force)
+  if (!range) return messages
+
+  // 建立 session 索引 → body 索引映射；同时提取已有累积摘要及其位置
+  let prior: string | null = null
+  let summaryMsgIndex = -1
+  const startMap = new Map<number, number>()
+  const coveredAt = (i: number): boolean => deps.session.summaries.some((s) => i >= s.fromIndex && i <= s.toIndex)
+  let si = 0
+  let bi = 0
+  while (bi < body.length) {
+    const m = body[bi]
+    if (typeof m.content === 'string' && m.content.startsWith(SUMMARY_MARKER)) {
+      prior = m.content.slice(SUMMARY_MARKER.length)
+      summaryMsgIndex = bi
+      bi++
+      continue
+    }
+    while (si < deps.session.messages.length && coveredAt(si)) si++
+    startMap.set(si, bi)
+    si++
+    bi++
+    if (m.role === 'assistant' && m.tool_calls?.length) bi += m.tool_calls.length // 跳过其 tool 消息
+  }
+
+  const msgStart = startMap.get(range.fromIndex)
+  let msgEnd = startMap.get(range.toIndex)
+  if (msgStart === undefined || msgEnd === undefined) return messages
+  const lastAssistant = body[msgEnd]
+  if (lastAssistant.role === 'assistant' && lastAssistant.tool_calls?.length) msgEnd += lastAssistant.tool_calls.length
+
+  // 生成摘要正文：LLM 语义摘要优先，异常时机械兜底（压缩流程永不因摘要失败而中断）
+  const transcript = buildSessionTranscript(deps.session, range.fromIndex, range.toIndex)
+  let text: string
+  if (deps.summarize) {
+    try { text = await deps.summarize(transcript, prior) }
+    catch { text = buildMechanicalSummary(deps.session, range.fromIndex, range.toIndex) }
+  } else {
+    text = buildMechanicalSummary(deps.session, range.fromIndex, range.toIndex)
+  }
+  text = text.trim().slice(0, 6000)
+
+  // 摘要落 session（持久化 + UI 卡片数据源）
+  const sm = deps.session.messages
+  deps.session.addSummary({
+    id: `sum_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+    fromIndex: range.fromIndex, toIndex: range.toIndex,
+    fromTs: sm[range.fromIndex].ts ?? 0, toTs: sm[range.toIndex].ts ?? 0,
+    text, messageCount: range.toIndex - range.fromIndex + 1, createdAt: Date.now(),
+  })
+
+  // LLM messages：用一条累积摘要替换「旧摘要消息 + 本次折叠段」
+  const replaceStart = summaryMsgIndex >= 0 ? summaryMsgIndex : msgStart
+  const summaryMessage: ChatMessage = { role: 'user', content: SUMMARY_MARKER + text }
+  const nextBody = [...body.slice(0, replaceStart), summaryMessage, ...body.slice(msgEnd + 1)]
+  return system ? [system, ...nextBody] : nextBody
 }
 
 /** 解析用户消息中的 @引用，读取文件或目录内容并拼接到消息前 */
@@ -427,7 +517,19 @@ async function buildApiMessages(
   const systemMsg: ChatMessage = { role: 'system', content: systemPrompt }
 
   const all: ChatMessage[] = []
-  for (const m of session.messages) {
+  // 已有摘要：被覆盖的消息不发送，在最早覆盖位置插入一条合并摘要（LLM 侧始终一条）
+  const summaryText = session.summaries.map((s) => s.text).join('\n\n')
+  let summaryInserted = false
+  for (let i = 0; i < session.messages.length; i++) {
+    const covered = session.summaries.some((s) => i >= s.fromIndex && i <= s.toIndex)
+    if (covered) {
+      if (!summaryInserted && summaryText) {
+        all.push({ role: 'user', content: SUMMARY_MARKER + summaryText })
+        summaryInserted = true
+      }
+      continue
+    }
+    const m = session.messages[i]
     if (m.role === 'user') {
       all.push({ role: 'user', content: m.content })
     } else {
@@ -450,7 +552,7 @@ async function buildApiMessages(
     }
   }
 
-  return compressHistory([systemMsg, ...all])
+  return [systemMsg, ...all]
 }
 
 /** 单个工具结果长度上限（字符）——设为极大值，实际不截断 */
@@ -644,8 +746,9 @@ export async function runAgent(userText: string, deps: AgentDeps, token: vscode.
         if (token.isCancellationRequested || abort.signal.aborted) return
       }
 
-      // 每轮开始前压缩一次历史，防止长任务中上下文无限膨胀
-      messages = compressHistory(messages)
+      // 每轮开始前语义压缩一次历史（自动按阈值/轮次，或响应手动请求），防上下文无限膨胀
+      const forceCompress = deps.consumeCompressRequest?.() ?? false
+      messages = await semanticCompress(messages, deps, forceCompress)
 
       const assistantMsg: SessionMessage = deps.session.add({
         role: 'assistant', content: '', time: deps.session.now(), toolRuns: [],

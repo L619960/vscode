@@ -29,8 +29,24 @@ export interface SessionMeta {
   createdAt: number
   updatedAt: number
 }
+/** 历史摘要：覆盖一段已折叠消息，LLM 请求时用摘要正文替代该段原文 */
+export interface ConversationSummary {
+  id: string
+  /** 覆盖的 messages 索引区间（含端点） */
+  fromIndex: number
+  toIndex: number
+  /** 覆盖消息的时间戳边界 */
+  fromTs: number
+  toTs: number
+  /** 摘要正文（LLM 生成，失败时为机械摘要） */
+  text: string
+  /** 折叠的消息条数 */
+  messageCount: number
+  createdAt: number
+}
 export interface StoredSessionData extends SessionMeta {
   messages: SessionMessage[]
+  summaries?: ConversationSummary[]
 }
 
 const DEFAULT_TITLE = '新会话'
@@ -50,6 +66,8 @@ export class Session {
   createdAt: number
   updatedAt: number
   messages: SessionMessage[] = []
+  /** 历史摘要（按覆盖区间顺序，随消息持久化） */
+  summaries: ConversationSummary[] = []
   /**
    * 运行时状态（不持久化）：跨用户回合保持 Agent 流程状态，
    * 防止每次发消息都被流程闸门要求重新规划。重启后由 runAgent 从消息历史重建。
@@ -65,6 +83,7 @@ export class Session {
     this.createdAt = data.createdAt
     this.updatedAt = data.updatedAt
     this.messages = data.messages || []
+    this.summaries = data.summaries || []
     this.fire = fire
     this.getRules = getRules
     // 恢复时把中断的 running/awaiting 标记为 error
@@ -76,10 +95,22 @@ export class Session {
         }
       }
     }
-    // 恢复时按当前设置裁剪超限消息
-    if (this.messages.length > this.getRules().maxMessages) {
-      this.messages = this.messages.slice(-this.getRules().maxMessages)
+    // 恢复时按当前设置裁剪超限消息；同步平移摘要索引，丢弃完全落入被裁区间的摘要
+    const maxKeep = this.getRules().maxMessages
+    if (this.messages.length > maxKeep) {
+      const cut = this.messages.length - maxKeep
+      this.messages = this.messages.slice(-maxKeep)
+      this.summaries = this.summaries
+        .map((s) => ({ ...s, fromIndex: s.fromIndex - cut, toIndex: s.toIndex - cut }))
+        .filter((s) => s.toIndex >= 0)
     }
+  }
+
+  /** 追加一条历史摘要（覆盖 fromIndex..toIndex 的消息），并落盘 */
+  addSummary(s: ConversationSummary): void {
+    this.summaries.push(s)
+    this.summaries.sort((a, b) => a.fromIndex - b.fromIndex)
+    this.touch()
   }
 
   add(msg: SessionMessage): SessionMessage {
@@ -104,15 +135,17 @@ export class Session {
     this.touch()
   }
 
-  /** 截断：保留前 n 条消息（含），删除之后的；用于从某条消息回退 */
+  /** 截断：保留前 n 条消息（含），删除之后的；删除与被删区间有交集的摘要 */
   truncate(n: number): void {
     this.messages.splice(n + 1)
+    this.summaries = this.summaries.filter((s) => s.fromIndex <= n && s.toIndex <= n)
     this.touch()
   }
 
   /** 清空当前会话内容（保留会话本身） */
   clear(): void {
     this.messages = []
+    this.summaries = []
     this.touch()
   }
 
@@ -125,6 +158,7 @@ export class Session {
       id: this.id, title: this.title,
       createdAt: this.createdAt, updatedAt: this.updatedAt,
       messages: this.messages.slice(-this.getRules().maxMessages),
+      summaries: this.summaries,
     }
   }
 

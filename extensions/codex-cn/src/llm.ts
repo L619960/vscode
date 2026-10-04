@@ -92,8 +92,10 @@ export async function chatCompletion(opts: {
   signal: AbortSignal
   onToken?: (token: string) => void
   onDegraded?: () => void
+  /** 覆盖默认 max_tokens（摘要等小请求使用） */
+  maxTokens?: number
 }): Promise<ChatResult> {
-  const { messages, tools, config, signal, onToken, onDegraded } = opts
+  const { messages, tools, config, signal, onToken, onDegraded, maxTokens } = opts
 
   // 本地服务（llama.cpp / Ollama 等）无需 API Key
   const isLocal = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(config.baseUrl)
@@ -109,8 +111,8 @@ export async function chatCompletion(opts: {
       model: config.model,
       messages: cleanMsgs,
       stream: true,
-      // 16384 上限：支持大文件生成（如完整 Vue 组件/长代码），避免 write_file 参数截断
-      max_tokens: 16384,
+      // 默认 16384 支持大文件生成；摘要等场景可通过 maxTokens 覆盖
+      max_tokens: maxTokens ?? 16384,
       ...(withTools && tools?.length ? { tools, tool_choice: 'auto' } : {}),
     })
   }

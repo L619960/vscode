@@ -41,10 +41,10 @@ interface ToolGroup {
 }
 /** 时间线节点：按真实执行顺序排列 */
 type TLNode =
-  | { kind: 'think'; text: string }              // 回合首条文本（单行预览，点开看全文）
-  | { kind: 'text'; text: string }               // 中间说明文本（全文显示）
-  | { kind: 'group'; group: ToolGroup }          // 连续同名工具聚合组（明细直接可见）
-  | { kind: 'pending'; run: ToolRun }            // 执行中/待审批（单独呈现）
+  | { kind: 'think'; text: string; msgIdx: number }      // 回合首条文本（单行预览，点开看全文）
+  | { kind: 'text'; text: string; msgIdx: number }       // 中间说明文本（全文显示）
+  | { kind: 'group'; group: ToolGroup; msgIdx: number }  // 连续同名工具聚合组（明细直接可见）
+  | { kind: 'pending'; run: ToolRun; msgIdx: number }    // 执行中/待审批（单独呈现）
 /** 任务检查点（对接 AgentTaskCard 组件） */
 interface TaskCheckpoint {
   label: string               // 检查点名称
@@ -62,6 +62,7 @@ interface Segment {
   nodes: TLNode[]
   stepCount: number
   finalReply: string
+  finalReplyIdx?: number        // 最终回复来源消息下标（摘要覆盖判断用）
   isLive: boolean
   elapsed: string
   taskItems: TaskCheckpoint[]  // 任务清单（写类工具）
@@ -207,15 +208,15 @@ const segments = computed<Segment[]>(() => {
     let textSeen = 0
     for (const s of bodySteps) {
       const text = s.content.trim()
-      if (text) nodes.push({ kind: textSeen++ === 0 ? 'think' : 'text', text })
+      if (text) nodes.push({ kind: textSeen++ === 0 ? 'think' : 'text', text, msgIdx: s.idx })
       for (const t of s.toolRuns || []) {
         if (t.status === 'running' || t.status === 'awaiting') {
-          nodes.push({ kind: 'pending', run: t })
+          nodes.push({ kind: 'pending', run: t, msgIdx: s.idx })
           continue
         }
         const prev = nodes[nodes.length - 1]
         if (prev?.kind === 'group' && prev.group.name === t.name) prev.group.runs.push(t)
-        else nodes.push({ kind: 'group', group: { name: t.name, label: '', runs: [t], hasError: false } })
+        else nodes.push({ kind: 'group', group: { name: t.name, label: '', runs: [t], hasError: false }, msgIdx: s.idx })
       }
     }
     for (const n of nodes) {
@@ -265,7 +266,7 @@ const segments = computed<Segment[]>(() => {
     })
 
     const lastMsgIdx = seg.steps.length ? seg.steps[seg.steps.length - 1].idx : seg.userIdx
-    return { user: seg.user, userIdx: seg.userIdx, lastMsgIdx, steps, hasTools, nodes, stepCount: nodes.length + (finalReply ? 1 : 0), finalReply, isLive, elapsed, taskItems, hasPendingReview, unrecoveredErrors, retriedErrors }
+    return { user: seg.user, userIdx: seg.userIdx, lastMsgIdx, steps, hasTools, nodes, stepCount: nodes.length + (finalReply ? 1 : 0), finalReply, finalReplyIdx: lastIsFinal ? last.idx : undefined, isLive, elapsed, taskItems, hasPendingReview, unrecoveredErrors, retriedErrors }
   })
 })
 
@@ -314,6 +315,72 @@ const fileRefsClosed = ref(false)
 /** 只显示文件名，去掉目录前缀（hover 可见完整路径） */
 function baseName(p: string): string { return p.split(/[\\/]/).pop() ?? p }
 
+// ---- P3：历史摘要 + 上下文压缩 ----
+interface SummaryRecord {
+  id: string; fromIndex: number; toIndex: number
+  text: string; messageCount: number; createdAt: number
+}
+const summaries = ref<SummaryRecord[]>([])
+const maxMessages = ref(100)
+/** 摘要卡折叠 */
+const summaryCardClosed = ref(false)
+/** 展开正文的摘要 id 集合（新摘要自动展开） */
+const expandedSummaries = ref<Set<string>>(new Set())
+/** 是否强制显示被折叠的原始消息 */
+const showCovered = ref(false)
+/** 压缩请求进行中（摘要返回后复位） */
+const compressing = ref(false)
+
+/** 消息下标是否被某条摘要覆盖（用户要求显示原文时一律不覆盖） */
+function isIndexCovered(idx?: number): boolean {
+  if (idx === undefined || showCovered.value) return false
+  return summaries.value.some((s) => idx >= s.fromIndex && idx <= s.toIndex)
+}
+/** 该段是否整体被覆盖（用于整段隐藏） */
+function segFullyCovered(seg: { userIdx?: number }): boolean {
+  return seg.userIdx !== undefined && isIndexCovered(seg.userIdx)
+}
+/** 段中可见节点（过滤被覆盖的节点） */
+function visibleNodes(seg: { nodes: TLNode[] }): TLNode[] {
+  return seg.nodes.filter((n) => !isIndexCovered(n.msgIdx))
+}
+const coveredCount = computed(() =>
+  summaries.value.reduce((n, s) => n + s.messageCount, 0))
+
+function toggleSummaryText(id: string): void {
+  const next = new Set(expandedSummaries.value)
+  if (next.has(id)) next.delete(id); else next.add(id)
+  expandedSummaries.value = next
+}
+function fmtSummaryTime(t: number): string {
+  return new Date(t).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+/** 请求压缩历史：运行中由 agent 下一轮执行，空闲时宿主立即执行 */
+function requestCompress(): void {
+  if (compressing.value) return
+  compressing.value = true
+  vscodeApi.postMessage({ type: 'compressNow' })
+}
+
+// 上下文使用率
+const usageRatio = computed(() => messages.value.length / maxMessages.value)
+const usageHigh = computed(() => usageRatio.value >= 0.9)
+const showUsageBar = computed(() => usageRatio.value >= 0.75)
+
+// 摘要更新：新摘要自动展开正文，并结束压缩 loading
+watch(summaries, (next, prev) => {
+  if (next.length > prev.length) {
+    const ids = new Set(expandedSummaries.value)
+    ids.add(next[next.length - 1].id)
+    expandedSummaries.value = ids
+  }
+  compressing.value = false
+})
+
+/** 整段被摘要覆盖的段不渲染 */
+const visibleSegments = computed(() => segments.value.filter((seg) => !segFullyCovered(seg)))
+
 onMounted(() => {
   window.addEventListener('message', (e: MessageEvent) => {
     const m = e.data
@@ -322,6 +389,8 @@ onMounted(() => {
       running.value = m.running
       paused.value = m.paused ?? false
       stepping.value = m.stepping ?? false
+      if (m.summaries) summaries.value = m.summaries
+      if (m.maxMessages !== undefined) maxMessages.value = m.maxMessages
       checkpoints.value = m.checkpoints ?? 0
       todos.value = m.todos || []
       if (m.sessions) sessions.value = m.sessions
@@ -690,6 +759,38 @@ watch(running, (now, prev) => {
 
     <div class="msg-list" ref="msgListEl">
       <!-- AI 任务规划（todo_write 驱动） -->
+      <!-- 上下文将满提示：≥75% 黄色预警，≥90% 红色，可直接压缩历史 -->
+      <div v-if="showUsageBar" class="usage-bar" :class="{ high: usageHigh }">
+        <span class="usage-text">⚠️ 上下文已用 {{ messages.length }}/{{ maxMessages }}（{{ Math.round(usageRatio * 100) }}%）</span>
+        <button class="mini phase-btn" @click="requestCompress" :disabled="compressing">
+          {{ compressing ? '压缩中…' : '🗜 压缩历史' }}
+        </button>
+      </div>
+
+      <!-- 历史摘要：每条可展开正文；可切换显示被折叠的原始消息 -->
+      <div v-if="summaries.length" class="summary-card">
+        <div class="plan-head" @click="summaryCardClosed = !summaryCardClosed">
+          <span class="plan-title">📝 历史摘要</span>
+          <span class="plan-progress">{{ summaries.length }} 段 · {{ coveredCount }} 条消息已折叠</span>
+          <span class="plan-arrow">{{ summaryCardClosed ? '▸' : '▾' }}</span>
+        </div>
+        <div class="summary-list" v-show="!summaryCardClosed">
+          <div v-for="s in summaries" :key="s.id" class="summary-item">
+            <div class="summary-item-head" @click="toggleSummaryText(s.id)">
+              <span class="summary-time">{{ fmtSummaryTime(s.createdAt) }}</span>
+              <span class="summary-count">折叠 {{ s.messageCount }} 条</span>
+              <span class="plan-arrow">{{ expandedSummaries.has(s.id) ? '▾' : '▸' }}</span>
+            </div>
+            <div class="summary-text" v-show="expandedSummaries.has(s.id)">{{ s.text }}</div>
+          </div>
+        </div>
+        <div class="summary-foot">
+          <button class="mini" @click="showCovered = !showCovered">
+            {{ showCovered ? '🙈 隐藏原始消息' : '👁 显示原始消息' }}
+          </button>
+        </div>
+      </div>
+
       <div v-if="todos.length" class="plan-card">
         <div class="plan-head" @click="planClosed = !planClosed">
           <span class="plan-title">📋 任务规划</span>
@@ -728,7 +829,7 @@ watch(running, (now, prev) => {
         <p>👋 描述你的任务</p>
         <span>AI 会读项目、改文件、跑命令</span>
       </div>
-      <template v-for="(seg, si) in segments" :key="si">
+      <template v-for="(seg, si) in visibleSegments" :key="si">
         <!-- 用户提问：紫色气泡 + 时间 + 操作（路径可点击打开） -->
         <div v-if="seg.user" class="msg user">
           <div class="bubble"><template v-for="(p, pi) in linkify(seg.user.content)" :key="pi"><a v-if="p.t === 'path'" class="flink" @click="openFile(p.v)">{{ p.v }}</a><span v-else>{{ p.v }}</span></template></div>
@@ -744,7 +845,8 @@ watch(running, (now, prev) => {
 
         <!-- 纯闲聊：无工具调用，普通气泡 -->
         <template v-if="!seg.hasTools">
-          <div v-for="(s, j) in seg.steps" :key="j" class="msg assistant">
+          <template v-for="(s, j) in seg.steps" :key="j">
+          <div class="msg assistant" v-if="!isIndexCovered(s.idx)">
             <div class="bubble"><template v-for="(p, pi) in linkify(s.content)" :key="pi"><a v-if="p.t === 'path'" class="flink" @click="openFile(p.v)">{{ p.v }}</a><span v-else>{{ p.v }}</span></template></div>
             <div class="msg-footer">
               <div class="msg-actions">
@@ -753,6 +855,7 @@ watch(running, (now, prev) => {
               </div>
             </div>
           </div>
+          </template>
         </template>
 
         <!-- Agent 回合：Vant4 van-collapse 折叠时间线 -->
@@ -812,7 +915,7 @@ watch(running, (now, prev) => {
 
               <!-- 步骤区（思考、文本、工具、pending） -->
               <div class="agent-steps">
-                <template v-for="(node, ni) in seg.nodes" :key="ni">
+                <template v-for="(node, ni) in visibleNodes(seg)" :key="ni">
                 <!-- 思考：Trae 风格折叠块，左图标右箭头，默认收起，点击平滑展开 -->
                 <div v-if="node.kind === 'think'" class="step">
                   <div class="step-rail"><span class="step-ico">💡</span></div>
@@ -885,7 +988,7 @@ watch(running, (now, prev) => {
           </van-collapse-item>
 
           <!-- ✅ 最终回复：放在 van-collapse-item 外面，永远可见！（路径可点击） -->
-          <div v-if="seg.finalReply" class="step reply-step final-reply">
+          <div v-if="seg.finalReply && !isIndexCovered(seg.finalReplyIdx)" class="step reply-step final-reply">
             <div class="step-rail"><span class="step-ico end"></span></div>
             <div class="step-main">
               <div class="reply-body"><template v-for="(p, pi) in linkify(seg.finalReply)" :key="pi"><a v-if="p.t === 'path'" class="flink" @click="openFile(p.v)">{{ p.v }}</a><span v-else>{{ p.v }}</span></template></div>
