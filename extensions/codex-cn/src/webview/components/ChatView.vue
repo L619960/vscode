@@ -1079,8 +1079,6 @@ watch(running, (now, prev) => {
         <button class="icon-btn plus" title="添加（开发中）" type="button">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
         </button>
-        <!-- 权限审批 -->
-        <AgentPermissionPop />
         <!-- Agent 类型 -->
         <AgentSelectPop @change="(m: 'chat'|'agent') => agentMode = m" />
         <span class="spacer"></span>
